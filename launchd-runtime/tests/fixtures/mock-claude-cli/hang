@@ -1,0 +1,19 @@
+#!/bin/bash
+# Mock claude-cli that hangs indefinitely — simulates the 9-hour stuck
+# sessions we hit on 2026-05-10 and the 6.5-hour idle on 2026-05-11.
+# The runner's watchdog MUST kill this within wall-clock timeout.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.128 (Claude Code) [MOCK: hang]"
+    exit 0
+fi
+
+# Trap signals so we record what killed us
+trap 'echo "Mock claude-cli: got SIGTERM, exiting cleanly" >&2; exit 143' TERM
+trap 'echo "Mock claude-cli: got SIGINT, exiting cleanly" >&2; exit 130' INT
+
+echo "Mock claude-cli: starting endless hang..."
+# Sleep in 1-second chunks so we're responsive to signals
+while true; do
+    sleep 1
+done

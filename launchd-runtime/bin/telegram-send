@@ -1,0 +1,168 @@
+#!/usr/bin/python3
+"""Send a Telegram message from a file, and record that it was sent.
+
+Usage: telegram-send <message-file>
+
+Reads TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID from the environment.
+Prints 'sent message_id=<id>' on success; exits nonzero on failure.
+
+A send counts as accepted only when Telegram answers ok:true; a 200 carrying
+ok:false is a rejection and exits nonzero.
+
+Every accepted send appends one row to $METRICS_DIR/sends.jsonl, so "did the
+pipeline tell me about this PR?" is answerable from a file instead of from a
+human's Telegram scrollback. ROUTINE and ROUTINE_RUN_ID come from _run.sh, so
+a row joins runs.jsonl on run_id; refs carry the owner/repo#N the message
+pointed at, so a row joins the GitHub side too. The ledger is best-effort: a
+write that fails warns on stderr and leaves the exit code alone, because by
+then the message has already been delivered.
+
+Deliberately does NOT delete the message file: rm is guarded, not blanket-
+denied; we still never rm and never chain, and callers overwrite the same
+literal path on the next run.
+"""
+import datetime
+import hashlib
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.request
+
+DEFAULT_METRICS_DIR = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "metrics")
+
+# The two ways a message points at a GitHub object: the full URL a digest
+# pastes, and the owner/repo#N shorthand a summary line uses. One alternation
+# rather than two passes, so refs come out in the order the message names them.
+# The lookbehind on the bare form stops it re-matching inside a URL.
+_REF_RE = re.compile(
+    r"github\.com/([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9._-]+)/(?:issues|pull)/(\d+)"
+    r"|(?<![A-Za-z0-9._/-])([A-Za-z0-9][A-Za-z0-9._-]*)/([A-Za-z0-9._-]+)#(\d+)"
+)
+
+
+def extract_refs(text):
+    """Every owner/repo#N the message points at, first mention wins."""
+    refs = []
+    for m in _REF_RE.finditer(text):
+        owner, repo, num = m.group(1, 2, 3) if m.group(1) else m.group(4, 5, 6)
+        ref = f"{owner}/{repo}#{num}"
+        if ref not in refs:
+            refs.append(ref)
+    return refs
+
+
+def record_send(text, message_id):
+    """Append one ledger row for a delivered message. Callers catch."""
+    metrics_dir = os.environ.get("METRICS_DIR") or DEFAULT_METRICS_DIR
+    row = {
+        # ISO-8601 with an offset, where runs.jsonl uses a human timestamp:
+        # nothing but a tool reads this file, and run_id is the join key.
+        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "routine": os.environ.get("ROUTINE") or "interactive",
+        "run_id": os.environ.get("ROUTINE_RUN_ID") or None,
+        "message_id": message_id,
+        "chars": len(text),
+        # The message itself is not recorded — the ledger says a send happened
+        # and what it referenced, and the digest is already in the routine log.
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        "refs": extract_refs(text),
+    }
+    os.makedirs(metrics_dir, exist_ok=True)
+    with open(os.path.join(metrics_dir, "sends.jsonl"), "a", encoding="utf-8") as f:
+        f.write(json.dumps(row) + "\n")
+
+
+def read_secrets():
+    """KEY=value pairs from the local secrets file, or {} when it is absent or
+    anyone but its owner can read it."""
+    path = os.environ.get("SECRETS_FILE") or os.path.join(
+        os.path.dirname(os.path.realpath(__file__)), "..", "secrets.env")
+    out = {}
+    try:
+        if os.stat(path).st_mode & 0o077:
+            return out
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                key, sep, value = line.strip().partition("=")
+                if sep and key and not key.startswith("#"):
+                    out[key] = value.strip().strip("\"'")
+    except OSError:
+        pass
+    return out
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: telegram-send <message-file>", file=sys.stderr)
+        return 2
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        # A routine gets both from _run.sh. A session that has neither set can
+        # keep them in the local secrets file instead of in its environment.
+        local = read_secrets()
+        token = token or local.get("TELEGRAM_BOT_TOKEN", "")
+        chat_id = chat_id or local.get("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        print("error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set, in the environment "
+              "or in launchd-runtime/secrets.env", file=sys.stderr)
+        return 2
+    try:
+        with open(sys.argv[1], encoding="utf-8") as f:
+            text = f.read().strip()
+    except OSError as e:
+        print(f"error: cannot read message file: {e}", file=sys.stderr)
+        return 2
+    if not text:
+        print("error: message file is empty", file=sys.stderr)
+        return 2
+
+    # TELEGRAM_API_URL override matches _run.sh — lets the test harness
+    # point at the mock server.
+    api_base = os.environ.get("TELEGRAM_API_URL", "https://api.telegram.org")
+    # disable_web_page_preview matches the inline senders this script
+    # replaced — without it, any URL in a digest grows a preview card.
+    payload = json.dumps(
+        {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    ).encode("utf-8")
+    req = urllib.request.Request(
+        f"{api_base}/bot{token}/sendMessage",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"error: HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:500]}", file=sys.stderr)
+        return 1
+    except (urllib.error.URLError, OSError) as e:
+        print(f"error: network failure: {e}", file=sys.stderr)
+        return 1
+
+    # A 200 is not delivery. Telegram reports a rejected message — unknown
+    # chat, a bot the user has blocked — as ok:false inside a 200 body, so
+    # reading the status code as the outcome would print a message_id of None
+    # and record an undelivered message in the ledger as sent.
+    if body.get("ok") is not True:
+        print(f"error: Telegram rejected the message: "
+              f"{body.get('description') or body}", file=sys.stderr)
+        return 1
+
+    message_id = (body.get("result") or {}).get("message_id")
+    # Broad on purpose: an unwritable metrics dir, a full disk or a value that
+    # will not serialise must not turn a delivered message into a failed send,
+    # which is what the caller would retry on.
+    try:
+        record_send(text, message_id)
+    except Exception as e:
+        print(f"warning: send not recorded in sends.jsonl: {e}", file=sys.stderr)
+    print(f"sent message_id={message_id}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

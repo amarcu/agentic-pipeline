@@ -1,0 +1,17 @@
+#!/bin/bash
+# Mock Unity editor. Exit codes and report shapes are the real editor's,
+# measured under 6000.3.11f1: 0 passed, 2 a test failed, 1 no verdict.
+OUT=""; LOGF=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -testResults) OUT="$2"; shift 2 ;;
+        -logFile)     LOGF="$2"; shift 2 ;;
+        *)            shift ;;
+    esac
+done
+
+cat > "$OUT" <<'XML'
+<?xml version="1.0" encoding="utf-8"?>
+<test-run id="2" testcasecount="0" result="Passed" total="0" passed="0" failed="0" skipped="0" />
+XML
+exit 0

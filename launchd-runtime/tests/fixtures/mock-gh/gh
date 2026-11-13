@@ -1,0 +1,183 @@
+#!/bin/bash
+# Mock gh with the surface pr-review-bundle, triage-repo.sh, cursor-review and
+# unstick's agenda actually call.
+# Serves canned responses out of $MOCK_GH_DIR — one file per call shape — and
+# exits 1 for anything the fixture directory does not answer. That last part is
+# load-bearing: omitting issue-<n>.json is how a test exercises the "issue
+# could not be fetched" path, omitting tree-paths.txt the tree-call fallback,
+# and omitting issue-list.json triage-repo's ERROR block.
+#
+# The list calls apply the caller's `--jq` expression, because for triage-repo
+# that expression IS the classification under test. Real gh runs it in its own
+# embedded jq; here it runs in $JQ_BIN, which the suite resolves the same way
+# the runner does.
+#
+# For a caller that reads several repos in one run (the agenda), `--repo
+# <owner>/<name>` serves from $MOCK_GH_DIR/<owner>-<name>/ when that directory
+# exists, and `api repos/<owner>/<name>/contents/<path>` serves
+# <owner>-<name>/contents/<path> or GitHub's 404 for a file that is not there.
+# With $MOCK_GH_LOG set every call's argv is appended to it, one call per line,
+# so a test can assert what was asked of GitHub and not only what came back.
+set -u
+
+dir="${MOCK_GH_DIR:?MOCK_GH_DIR not set}"
+
+if [[ -n "${MOCK_GH_LOG:-}" ]]; then
+    printf '%s\n' "$*" >> "$MOCK_GH_LOG"
+fi
+
+repo_flag="" prev=""
+for a in "$@"; do
+    [[ "$prev" == "--repo" ]] && repo_flag="$a"
+    prev="$a"
+done
+if [[ -n "$repo_flag" && -d "$dir/$(echo "$repo_flag" | /usr/bin/tr / -)" ]]; then
+    dir="$dir/$(echo "$repo_flag" | /usr/bin/tr / -)"
+fi
+
+serve() {
+    [[ -f "$1" ]] || exit 1
+    /bin/cat "$1"
+    exit 0
+}
+
+# serve_jq <file> <the caller's argv…> — filter through --jq when one is given.
+serve_jq() {
+    local file="$1" expr="" prev="" a
+    shift
+    [[ -f "$file" ]] || exit 1
+    for a in "$@"; do
+        [[ "$prev" == "--jq" ]] && expr="$a"
+        prev="$a"
+    done
+    if [[ -n "$expr" ]]; then
+        # No `${JQ_BIN:-jq}` fallback. Real gh runs --jq in its own embedded jq
+        # and cannot fail this way, so a mock that quietly resolves a different
+        # jq — or none — invents a behaviour the thing under test will never
+        # see. On the pipeline host a bare `jq` is not on PATH at all, and the
+        # empty stdout that produced read as "the endpoint returned nothing".
+        if [[ -z "${JQ_BIN:-}" || ! -x "${JQ_BIN:-}" ]]; then
+            echo "mock gh: JQ_BIN is unset or not executable ('${JQ_BIN:-}')." >&2
+            echo "  tests/helpers.sh resolves and exports it; --jq cannot be served without it." >&2
+            exit 90
+        fi
+        "$JQ_BIN" -r "$expr" < "$file"
+        exit $?
+    fi
+    /bin/cat "$file"
+    exit 0
+}
+
+case "${1:-}" in
+    pr)
+        case "${2:-}" in
+            view) serve "$dir/pr-view.json" ;;
+            diff) serve "$dir/diff.patch" ;;
+            list) serve_jq "$dir/pr-list.json" "$@" ;;
+        esac
+        ;;
+    issue)
+        case "${2:-}" in
+            view) serve "$dir/issue-${3:-}.json" ;;
+            list) serve_jq "$dir/issue-list.json" "$@" ;;
+        esac
+        ;;
+    api)
+        case "${2:-}" in
+            repos/*/pulls\?*|repos/*/pulls/*/reviews\?*|repos/*/pulls/*/comments\?*|repos/*/issues/*/comments\?*)
+                # review-rollup's reads: a query string on the path, and one
+                # file per pull request, because the rollup compares PRs with
+                # different review histories in one run. A PR with no file has
+                # no reviews or comments, which GitHub answers with an empty
+                # list and not a 404; the pulls listing itself has to exist.
+                # --slurp wraps the page in an array, as real gh does.
+                path="${2%%\?*}"
+                rest="${path#repos/}"
+                slug=$(echo "$rest" | /usr/bin/cut -d/ -f1-2 | /usr/bin/tr / -)
+                [[ -d "$dir/$slug" ]] && dir="$dir/$slug"
+                case "$path" in
+                    */pulls)             file="$dir/pulls.json" ;;
+                    */pulls/*/reviews)   n="${path%/reviews}";  file="$dir/reviews-${n##*/}.json" ;;
+                    */pulls/*/comments)  n="${path%/comments}"; file="$dir/review-comments-${n##*/}.json" ;;
+                    */issues/*/comments) n="${path%/comments}"; file="$dir/issue-comments-${n##*/}.json" ;;
+                esac
+                slurp=0
+                for a in "$@"; do [[ "$a" == "--slurp" ]] && slurp=1; done
+                if [[ ! -f "$file" ]]; then
+                    if [[ "$path" == */pulls ]]; then
+                        echo "gh: Not Found (HTTP 404)" >&2
+                        exit 1
+                    fi
+                    [[ $slurp -eq 1 ]] && echo '[[]]' || echo '[]'
+                    exit 0
+                fi
+                if [[ $slurp -eq 1 ]]; then
+                    "${JQ_BIN:?JQ_BIN not set}" -s . "$file"
+                    exit $?
+                fi
+                /bin/cat "$file"
+                exit 0
+                ;;
+            repos/*/contents/*)
+                rest="${2#repos/}"
+                slug=$(echo "${rest%%/contents/*}" | /usr/bin/tr / -)
+                file="$dir/$slug/contents/${rest#*/contents/}"
+                if [[ -f "$file" ]]; then
+                    /bin/cat "$file"
+                    exit 0
+                fi
+                echo "gh: Not Found (HTTP 404)" >&2
+                exit 1
+                ;;
+            */pulls/*/files) serve "$dir/files.json" ;;
+            */git/trees/*)   serve "$dir/tree-paths.txt" ;;
+            */pulls/*/comments) serve_jq "$dir/review-comments.json" "$@" ;;
+            */issues/*/comments)
+                # A --input file means a POST. cursor-review sends the findings
+                # it could not anchor to a diff line as one tagged comment, so a
+                # test has to see that comment as well as the review.
+                input="" prev=""
+                for a in "$@"; do
+                    [[ "$prev" == "--input" ]] && input="$a"
+                    prev="$a"
+                done
+                if [[ -n "$input" ]]; then
+                    n=1
+                    while [[ -f "$dir/issue-comment-post-$n.json" ]]; do n=$((n + 1)); done
+                    /bin/cp "$input" "$dir/issue-comment-post-$n.json"
+                    echo '{"id": 900002}'
+                    exit 0
+                fi
+                serve_jq "$dir/issue-comments.json" "$@"
+                ;;
+            */pulls/*/reviews)
+                # A body file means a POST. Each one is kept under its own
+                # number, because the 422 fallback posts a second review and a
+                # test has to see both the attempt and what replaced it.
+                input="" prev=""
+                for a in "$@"; do
+                    [[ "$prev" == "--input" ]] && input="$a"
+                    prev="$a"
+                done
+                if [[ -n "$input" ]]; then
+                    n=1
+                    while [[ -f "$dir/review-post-$n.json" ]]; do n=$((n + 1)); done
+                    /bin/cp "$input" "$dir/review-post-$n.json"
+                    # reviews-reject-inline makes the fixture behave like a PR
+                    # whose diff does not contain the anchored lines.
+                    if [[ -f "$dir/reviews-reject-inline" ]] \
+                       && /usr/bin/grep -q '"comments"' "$input"; then
+                        echo "gh: Validation Failed (HTTP 422)" >&2
+                        exit 1
+                    fi
+                    echo '{"id": 900001, "state": "COMMENTED"}'
+                    exit 0
+                fi
+                serve_jq "$dir/reviews.json" "$@"
+                ;;
+        esac
+        ;;
+esac
+
+echo "mock gh: unhandled call: $*" >&2
+exit 1

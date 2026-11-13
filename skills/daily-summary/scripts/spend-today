@@ -1,0 +1,107 @@
+#!/usr/bin/python3
+"""Print one SPEND: line for a day's routine spend, or nothing at all.
+
+Usage: spend-today <YYYY-MM-DD> [metrics-dir]
+
+Reads the two append-only ledgers the runtime writes:
+
+  runs.jsonl   one row per routine run (_run.sh). `ts` is a local human
+               timestamp -- "2026-09-03 18:07:12 CEST" -- `routine` names the
+               routine, and `cost_usd` is null on a watchdog kill.
+  sends.jsonl  one row per delivered Telegram (telegram-send). `ts` is
+               ISO-8601 with an offset.
+
+Both timestamps start with YYYY-MM-DD, which is the whole matching rule.
+
+Silence is a valid answer. An absent metrics directory, an empty ledger or a
+day with no rows all print nothing and exit 0, so the digest omits the spend
+line rather than reporting a $0.00 it never measured.
+
+At most the three costliest routines are named, matching what
+references/digest-format.md says the digest may show, so the named costs are a
+sample and `total_usd` is the authoritative figure. `runs=` says how many rows
+went into it.
+
+Python rather than jq deliberately: /usr/bin/jq only exists on macOS 15+, so
+_run.sh resolves jq from a candidate list and a hardcoded jq path in an
+allowed-tools prefix is a denial waiting to happen on the pipeline host.
+/usr/bin/python3 is present on every macOS this stack runs on.
+"""
+import json
+import os
+import sys
+
+DEFAULT_METRICS_DIR = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "metrics")
+
+# references/digest-format.md caps the digest's spend line at three routines.
+# Enforced here so the cap holds wherever the line is rendered from.
+MAX_ROUTINES_NAMED = 3
+
+
+def rows_for(path, date):
+    """Every parsable object in `path` whose `ts` starts with `date`.
+
+    A bad line is skipped, never fatal. Both ledgers are appended to while a
+    watchdog may kill the writer part-way, so the last line can be a truncated
+    JSON object or a half-written UTF-8 sequence -- and a decode that raised
+    would cost the whole day's figure over one byte. Hence errors="replace",
+    which turns undecodable bytes into a character json.loads then rejects,
+    and a line-at-a-time read: a ledger holding months of runs is not worth
+    loading into memory to find one day in it.
+    """
+    matched = []
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and str(row.get("ts") or "").startswith(date):
+                    matched.append(row)
+    except OSError:
+        return matched
+    return matched
+
+
+def main():
+    if len(sys.argv) not in (2, 3):
+        print("usage: spend-today <YYYY-MM-DD> [metrics-dir]", file=sys.stderr)
+        return 2
+    date = sys.argv[1]
+    if len(sys.argv) == 3:
+        metrics_dir = sys.argv[2]
+    else:
+        metrics_dir = os.environ.get("METRICS_DIR") or DEFAULT_METRICS_DIR
+
+    runs = rows_for(os.path.join(metrics_dir, "runs.jsonl"), date)
+    sends = rows_for(os.path.join(metrics_dir, "sends.jsonl"), date)
+    if not runs and not sends:
+        return 0
+
+    total = 0.0
+    by_routine = {}
+    for row in runs:
+        try:
+            cost = float(row.get("cost_usd") or 0)
+        except (TypeError, ValueError):
+            cost = 0.0
+        name = str(row.get("routine") or "unknown")
+        by_routine[name] = by_routine.get(name, 0.0) + cost
+        total += cost
+
+    parts = ["SPEND:", "date=%s" % date, "total_usd=%.2f" % total,
+             "runs=%d" % len(runs), "sends=%d" % len(sends)]
+    ranked = sorted(by_routine.items(), key=lambda kv: (-kv[1], kv[0]))
+    for name, cost in ranked[:MAX_ROUTINES_NAMED]:
+        parts.append("%s=%.2f" % (name, cost))
+    print(" ".join(parts))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

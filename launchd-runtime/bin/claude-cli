@@ -1,0 +1,51 @@
+#!/bin/bash
+# Stable wrapper around the Claude Code CLI.
+#
+# On this machine there are TWO installs:
+#   1. Standalone at ~/.local/bin/claude — self-updates via `claude --update`,
+#      so it's the one that lands new features (agent view, --bg, etc.) fastest.
+#   2. Bundled inside Claude Desktop at ~/Library/Application Support/Claude/
+#      claude-code/<version>/ — updates only when Desktop's Squirrel runs.
+#
+# Preference order:
+#   1. $CLAUDE_BIN env var (escape hatch for tests / pinning to a specific binary)
+#   2. ~/.local/bin/claude (the standalone — usually newest because of --update)
+#   3. Highest version inside the Desktop bundle (fallback)
+#
+# Usage: claude-cli -p "prompt"    (or any other claude flags)
+
+set -euo pipefail
+
+# Explicit override wins outright.
+if [[ -n "${CLAUDE_BIN:-}" ]]; then
+    if [[ ! -x "$CLAUDE_BIN" ]]; then
+        echo "ERROR: CLAUDE_BIN=$CLAUDE_BIN is not executable" >&2
+        exit 1
+    fi
+    exec "$CLAUDE_BIN" "$@"
+fi
+
+# Standalone install — preferred because `claude --update` keeps it current.
+STANDALONE="$HOME/.local/bin/claude"
+if [[ -x "$STANDALONE" ]]; then
+    exec "$STANDALONE" "$@"
+fi
+
+# Fallback: latest version bundled inside Claude Desktop.
+CLAUDE_BASE="$HOME/Library/Application Support/Claude/claude-code"
+if [[ -d "$CLAUDE_BASE" ]]; then
+    LATEST=$(/bin/ls -1d "$CLAUDE_BASE"/*/ 2>/dev/null | /usr/bin/sort -V | /usr/bin/tail -1)
+    if [[ -n "$LATEST" ]] && [[ -x "${LATEST}claude.app/Contents/MacOS/claude" ]]; then
+        exec "${LATEST}claude.app/Contents/MacOS/claude" "$@"
+    fi
+fi
+
+echo "ERROR: no claude binary found." >&2
+echo "  Looked for:" >&2
+echo "    \$CLAUDE_BIN ($CLAUDE_BIN — empty or not executable)" >&2
+echo "    $STANDALONE" >&2
+echo "    $CLAUDE_BASE/<version>/claude.app/Contents/MacOS/claude" >&2
+echo "  Install one of:" >&2
+echo "    - Standalone CLI:    curl -fsSL https://claude.com/install.sh | bash" >&2
+echo "    - Claude Desktop:    https://claude.com/download" >&2
+exit 1

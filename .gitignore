@@ -1,0 +1,14 @@
+# Local secrets and per-machine settings — never commit these.
+.env
+config/local.conf
+
+# macOS and agent scratch state
+.DS_Store
+.claude/worktrees/
+
+# Machine-specific settings and secrets. Each has a tracked .example beside it.
+launchd-runtime/repos.conf
+launchd-runtime/machines.conf
+launchd-runtime/secrets.env
+permissions/protected-roots.local.conf
+launchd-runtime/tests/private-names.local

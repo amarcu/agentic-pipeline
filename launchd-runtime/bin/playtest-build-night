@@ -1,0 +1,28 @@
+#!/bin/bash
+# playtest-build-night — the playtest-build-night routine's precheck. It runs bin/playtest-build
+# for every repo in PLAYTEST_BUILD_REPOS and never starts a model on a normal run.
+#
+# _run.sh calls it through ROUTINE_PRECHECK. Exit 10 tells the runner "done, do not start the
+# model". Any other exit means the build routine itself broke, and the runner starts the model on
+# prompts/playtest-build-night.md, which only reports the failure. A failed BUILD is not that:
+# playtest-build tells the owner on Telegram and exits 0.
+#
+# The first line printed is the run summary (the runner records it as the skip reason).
+set -u
+HERE=$(cd "$(/usr/bin/dirname "$0")" && pwd)
+CONF="${REPOS_CONF:-$HERE/../repos.conf}"
+BUILD="${PLAYTEST_BUILD_BIN:-$HERE/playtest-build}"
+. "$CONF" || { echo "PLAYTEST-BUILD-RUN: error reason=cannot read $CONF"; exit 1; }
+
+OUT=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/playtest-build-night.XXXXXX") || exit 1
+status=0
+for repo in "${PLAYTEST_BUILD_REPOS[@]+"${PLAYTEST_BUILD_REPOS[@]}"}"; do
+    "$BUILD" "$repo" >> "$OUT" 2>&1 || status=1
+done
+
+count() { /usr/bin/grep -c "^PLAYTEST-BUILD: .*result=$1" "$OUT" 2>/dev/null || true; }
+echo "PLAYTEST-BUILD-RUN: released=$(count released) skipped=$(count skipped) failed=$(count failed) errors=$(count error) status=$status"
+/bin/cat "$OUT"
+/bin/rm -f "$OUT"
+[ "$status" -eq 0 ] && exit 10
+exit 1

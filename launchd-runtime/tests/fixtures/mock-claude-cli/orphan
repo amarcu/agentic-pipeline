@@ -1,0 +1,30 @@
+#!/bin/bash
+# Mock claude-cli that spawns an "orphan" child process that hangs.
+# Simulates the 8.5-hour `find /Users/dev` orphan bug from 2026-05-10.
+# The watchdog kills the WHOLE process group — the child should die too.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.128 (Claude Code) [MOCK: orphan]"
+    exit 0
+fi
+
+# Where to write the orphan child's PID so the test can verify it died.
+ORPHAN_PID_FILE="${MOCK_ORPHAN_PID_FILE:-/tmp/mock-orphan-pid.$$}"
+echo "Mock claude-cli: orphan PID file = $ORPHAN_PID_FILE" >&2
+
+# Spawn a child that just sleeps. It inherits our process group.
+(
+    # Make the orphan ignore SIGHUP so it survives parent exit (closer to real bug)
+    trap '' HUP
+    sleep 9999
+) &
+CHILD_PID=$!
+echo "$CHILD_PID" > "$ORPHAN_PID_FILE"
+
+echo "Mock claude-cli: spawned orphan child PID $CHILD_PID, parent now hanging"
+
+# Parent ALSO hangs so the watchdog has something to kill at the parent level
+trap 'echo "Mock claude-cli parent: SIGTERM" >&2; exit 143' TERM
+while true; do
+    sleep 1
+done

@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-skills.routines.dispatch-tasks-night</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTIC_HOME__/routines/_run.sh</string>
+        <string>dispatch-tasks-night</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>10</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-dispatch-tasks-night.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-dispatch-tasks-night.stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ROUTINE_CAPTURE_JSON</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>__HOME__/.unity/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <!-- 90 minutes, from 45 (2026-10-14). StarBonk workers run Unity twice each
+             (red, then green), and the 45-minute limit killed the dispatch twice
+             mid-gate (2026-09-28, 2026-10-14). tools/gate.sh in StarBonk now fails a
+             hung CLI in about 3 minutes, so this is room for real work, not hangs.
+             Ends by 05:40; pr-review-night skips a night while dispatch is live, and
+             the 07:00 merge lane reviews new PRs with Grok either way. -->
+        <key>ROUTINE_TIMEOUT_SECONDS</key>
+        <string>5400</string>
+        <!-- Five real tasks at the measured p95 of $2.51 each do not fit the
+             runner's $5.00 default; the cap would truncate the dispatch
+             mid-task. Still a runaway guard, not a target. -->
+        <key>ROUTINE_MAX_BUDGET_USD</key>
+        <string>15.00</string>
+    </dict>
+</dict>
+</plist>

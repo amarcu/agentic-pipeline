@@ -1,0 +1,49 @@
+#!/usr/bin/python3
+"""record-tool-failure - one friction-ledger row per failed tool call.
+
+Usage: record-tool-failure <metrics-dir>      (as a PostToolUseFailure hook)
+
+_run.sh registers this in the --settings it passes every routine. After a
+failed tool call Claude Code runs it with the event as JSON on stdin; in a
+headless run on 2026-09-13 that carried tool_name, tool_input, error,
+session_id, tool_use_id, cwd and is_interrupt. The row joins the run's other
+ledgers on ROUTINE_RUN_ID, which _run.sh exports, and on the session id
+outside a routine.
+
+It runs inside the routine it observes, so it must never change that run: it
+prints nothing and exits 0 on every path. A PostToolUseFailure hook that exits
+2 hands its stderr to the model.
+"""
+import json
+import os
+import sys
+import time
+
+LEDGER = "tool-failures.jsonl"
+FIELD_CAP = 300
+
+
+def main():
+    if len(sys.argv) != 2:
+        return
+    event = json.loads(sys.stdin.read())
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "routine": os.environ.get("ROUTINE") or None,
+        "run_id": os.environ.get("ROUTINE_RUN_ID") or event.get("session_id"),
+        "session_id": event.get("session_id"),
+        "tool": event.get("tool_name"),
+        "input": json.dumps(event.get("tool_input"), sort_keys=True)[:FIELD_CAP],
+        "error": str(event.get("error") or "").split("\n", 1)[0][:FIELD_CAP],
+    }
+    os.makedirs(sys.argv[1], exist_ok=True)
+    with open(os.path.join(sys.argv[1], LEDGER), "a") as ledger:
+        ledger.write(json.dumps(row) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

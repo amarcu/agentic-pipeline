@@ -1,0 +1,275 @@
+#!/usr/bin/python3
+"""Objective funnel metrics for the proposal -> approval -> PR -> merge pipeline.
+
+Extracts timestamped GitHub events across the repos in repos.conf and reports
+conversion rates the 2026-07-14 efficiency assessment identified as the
+pipeline's real bottleneck signals. Two rate families are kept separate on
+purpose (see assessment §8):
+
+  throughput rates  — raw conversion including items still awaiting attention;
+                      dominated by human review bandwidth
+  decision rates    — outcomes conditional on a human decision having happened
+                      (approved vs discarded, merged vs closed-unmerged);
+                      the closest objective proxy for artifact quality
+
+Identification markers (contract-based, not author-based — the agent acts
+under the user's own account so authorship is useless):
+  proposal   = issue that carries the `proposed` label (propose-tasks applies
+               it at creation; approval ADDS `approved`, so `proposed` stays)
+  approval   = `approved` labeled-event (only the human applies it)
+  discard    = issue closed while never approved
+  agent PR   = head branch matching task/issue-<N>-* (work-on-task convention)
+
+Usage: pipeline-metrics [--json] [--repo owner/repo ...]
+Requires: gh (authenticated). Read-only; makes no writes to GitHub.
+"""
+import argparse
+import json
+import os
+import re
+import statistics
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(
+    os.path.dirname(os.path.realpath(__file__)), "..", "repos.conf")
+TASK_BRANCH_RE = re.compile(r"^task/issue-\d+")
+NOW = datetime.now(timezone.utc)
+
+
+def gh_api(path):
+    """One paginated read-only gh api call; returns parsed JSON list/dict.
+
+    --slurp makes gh emit one JSON array whose elements are the per-page
+    responses, so the pages are separated structurally.
+
+    The previous implementation concatenated raw page bodies and re-split them
+    on the literal sequence "][", which is not a page boundary marker — it also
+    occurs inside string values (a PR body containing "][", for instance). On
+    the full repo roster that split landed mid-string and the run died with
+    "JSONDecodeError: Unterminated string". A partial funnel is worse than a
+    loud failure here, because roster and cap decisions are made on it.
+    """
+    out = subprocess.run(
+        ["gh", "api", "--paginate", "--slurp", path],
+        capture_output=True, text=True, timeout=300,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(f"gh api {path}: {out.stderr.strip()[:200]}")
+    text = out.stdout.strip()
+    if not text:
+        return []
+    pages = json.loads(text)
+    if not isinstance(pages, list):
+        return pages
+    if not pages:
+        return []
+    # A collection endpoint slurps to [[...], [...]]; a single-object endpoint
+    # (repos/O/R/pulls/N) slurps to [{...}] and its one caller expects the dict.
+    if isinstance(pages[0], list):
+        return [item for page in pages for item in page]
+    return pages[0]
+
+
+def parse_repos():
+    repos, seen = [], set()
+    in_priority = False
+    with open(REPOS_CONF) as f:
+        for line in f:
+            if "REPOS_BY_PRIORITY=(" in line:
+                in_priority = True
+                continue
+            if in_priority:
+                if line.strip() == ")":
+                    break
+                m = re.search(r'"([\w.-]+/[\w.-]+)"', line)
+                if m and m.group(1) not in seen:
+                    seen.add(m.group(1))
+                    repos.append(m.group(1))
+    return repos
+
+
+def iso(ts):
+    return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+
+
+def days(a, b):
+    return round((b - a).total_seconds() / 86400, 1)
+
+
+def median(vals):
+    return round(statistics.median(vals), 1) if vals else None
+
+
+def collect_repo(repo):
+    # --- proposals ---
+    issues = gh_api(f"repos/{repo}/issues?state=all&labels=proposed&per_page=100")
+    proposals = []
+    for it in issues:
+        if "pull_request" in it:
+            continue
+        labels = {l["name"] for l in it.get("labels", [])}
+        created = iso(it["created_at"])
+        closed = iso(it.get("closed_at"))
+        approved_at = None
+        if "approved" in labels:
+            events = gh_api(f"repos/{repo}/issues/{it['number']}/events?per_page=100")
+            for ev in events:
+                if ev.get("event") == "labeled" and ev.get("label", {}).get("name") == "approved":
+                    approved_at = iso(ev["created_at"])
+                    break
+        proposals.append({
+            "number": it["number"],
+            "created": created,
+            "approved_at": approved_at,
+            "closed_at": closed,
+            "state": it["state"],
+        })
+
+    # --- agent PRs ---
+    pulls = gh_api(f"repos/{repo}/pulls?state=all&per_page=100")
+    agent_prs = []
+    for pr in pulls:
+        if not TASK_BRANCH_RE.match(pr.get("head", {}).get("ref", "")):
+            continue
+        detail = gh_api(f"repos/{repo}/pulls/{pr['number']}")
+        agent_prs.append({
+            "number": pr["number"],
+            "created": iso(pr["created_at"]),
+            "merged_at": iso(pr.get("merged_at")),
+            "closed_at": iso(pr.get("closed_at")),
+            "draft": pr.get("draft", False),
+            "commits": detail.get("commits", 0),
+            "review_comments": detail.get("review_comments", 0),
+            "additions": detail.get("additions", 0),
+            "deletions": detail.get("deletions", 0),
+        })
+    return proposals, agent_prs
+
+
+def summarize(repo, proposals, agent_prs):
+    approved = [p for p in proposals if p["approved_at"]]
+    discarded = [p for p in proposals if not p["approved_at"] and p["state"] == "closed"]
+    pending = [p for p in proposals if not p["approved_at"] and p["state"] == "open"]
+    decided = len(approved) + len(discarded)
+
+    merged = [p for p in agent_prs if p["merged_at"]]
+    closed_unmerged = [p for p in agent_prs if p["closed_at"] and not p["merged_at"]]
+    open_prs = [p for p in agent_prs if not p["closed_at"] and not p["merged_at"]]
+    pr_decided = len(merged) + len(closed_unmerged)
+
+    return {
+        "repo": repo,
+        "proposals": {
+            "total": len(proposals),
+            "approved": len(approved),
+            "discarded": len(discarded),
+            "pending": len(pending),
+            "pending_age_median_d": median([days(p["created"], NOW) for p in pending]),
+            "time_to_approval_median_d": median(
+                [days(p["created"], p["approved_at"]) for p in approved]),
+            # decision rate: quality proxy, conditioned on human engagement
+            "approval_given_decision_pct": round(100 * len(approved) / decided, 1) if decided else None,
+            # throughput rate: includes the un-reviewed backlog
+            "approval_rate_raw_pct": round(100 * len(approved) / len(proposals), 1) if proposals else None,
+        },
+        "agent_prs": {
+            "total": len(agent_prs),
+            "merged": len(merged),
+            "closed_unmerged": len(closed_unmerged),
+            "open": len(open_prs),
+            "open_age_median_d": median([days(p["created"], NOW) for p in open_prs]),
+            "time_to_merge_median_d": median(
+                [days(p["created"], p["merged_at"]) for p in merged]),
+            "merge_given_decision_pct": round(100 * len(merged) / pr_decided, 1) if pr_decided else None,
+            "merge_rate_raw_pct": round(100 * len(merged) / len(agent_prs), 1) if agent_prs else None,
+            "rework_commits_median": median([p["commits"] for p in agent_prs]),
+            "review_comments_median": median([p["review_comments"] for p in agent_prs]),
+        },
+    }
+
+
+def totals(rows):
+    def s(section, key):
+        return sum(r[section][key] for r in rows)
+    agg_p_decided = s("proposals", "approved") + s("proposals", "discarded")
+    agg_pr_decided = s("agent_prs", "merged") + s("agent_prs", "closed_unmerged")
+    return {
+        "repo": "TOTAL",
+        "proposals": {
+            "total": s("proposals", "total"),
+            "approved": s("proposals", "approved"),
+            "discarded": s("proposals", "discarded"),
+            "pending": s("proposals", "pending"),
+            "pending_age_median_d": None,
+            "time_to_approval_median_d": None,
+            "approval_given_decision_pct": round(
+                100 * s("proposals", "approved") / agg_p_decided, 1) if agg_p_decided else None,
+            "approval_rate_raw_pct": round(
+                100 * s("proposals", "approved") / s("proposals", "total"), 1)
+                if s("proposals", "total") else None,
+        },
+        "agent_prs": {
+            "total": s("agent_prs", "total"),
+            "merged": s("agent_prs", "merged"),
+            "closed_unmerged": s("agent_prs", "closed_unmerged"),
+            "open": s("agent_prs", "open"),
+            "open_age_median_d": None,
+            "time_to_merge_median_d": None,
+            "merge_given_decision_pct": round(
+                100 * s("agent_prs", "merged") / agg_pr_decided, 1) if agg_pr_decided else None,
+            "merge_rate_raw_pct": round(
+                100 * s("agent_prs", "merged") / s("agent_prs", "total"), 1)
+                if s("agent_prs", "total") else None,
+            "rework_commits_median": None,
+            "review_comments_median": None,
+        },
+    }
+
+
+def print_table(rows):
+    print(f"{'repo':24} {'prop':>4} {'appr':>4} {'disc':>4} {'pend':>4} "
+          f"{'apr%dec':>7} {'t-appr':>6} | {'PRs':>3} {'mrg':>3} {'cls':>3} {'open':>4} "
+          f"{'mrg%dec':>7} {'openAge':>7}")
+    for r in rows:
+        p, q = r["proposals"], r["agent_prs"]
+        print(f"{r['repo']:24} {p['total']:>4} {p['approved']:>4} {p['discarded']:>4} "
+              f"{p['pending']:>4} {str(p['approval_given_decision_pct'] or '-'):>7} "
+              f"{str(p['time_to_approval_median_d'] or '-'):>6} | "
+              f"{q['total']:>3} {q['merged']:>3} {q['closed_unmerged']:>3} {q['open']:>4} "
+              f"{str(q['merge_given_decision_pct'] or '-'):>7} "
+              f"{str(q['open_age_median_d'] or '-'):>7}")
+    print("\ndecision rates (apr%dec, mrg%dec) are quality proxies — conditioned on a")
+    print("human decision. Raw counts include the un-reviewed backlog (throughput,")
+    print("not quality). Ages/times in days.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--json", action="store_true", help="emit full JSON instead of the table")
+    ap.add_argument("--repo", action="append", help="limit to specific repo(s)")
+    args = ap.parse_args()
+
+    repos = args.repo or parse_repos()
+    rows = []
+    for repo in repos:
+        try:
+            proposals, agent_prs = collect_repo(repo)
+            rows.append(summarize(repo, proposals, agent_prs))
+        except RuntimeError as e:
+            print(f"WARN {repo}: {e}", file=sys.stderr)
+    if not rows:
+        print("no data", file=sys.stderr)
+        return 1
+    rows.append(totals(rows))
+    if args.json:
+        json.dump(rows, sys.stdout, indent=1, default=str)
+        print()
+    else:
+        print_table(rows)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

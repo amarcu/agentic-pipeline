@@ -1,0 +1,77 @@
+#!/usr/bin/python3
+"""record-tool-call - one trace-ledger row per completed tool call.
+
+Usage: record-tool-call <metrics-dir>      (as a PostToolUse hook)
+
+runs.jsonl says a run took forty minutes and what it cost. It does not say
+where the forty minutes went: the ledgers held only the steps that failed
+(tool-failures.jsonl) or were refused (denials.jsonl), and a step that worked
+left nothing. This is the other half. _run.sh registers it beside
+record-tool-failure, and bin/run-trace reads both back as one timeline.
+
+After a tool call completes Claude Code runs this with the event as JSON on
+stdin; in a headless run on 2026-11-12 that carried tool_name, tool_input,
+tool_response, tool_use_id, duration_ms, session_id, prompt_id and cwd. A
+failed call does not arrive here: it goes to PostToolUseFailure.
+
+The row keeps the tool, how long it took, and a short label for what it was
+asked: a command's first line, a path's end, a skill's name. It never keeps
+tool_response, and it caps the label, because a ledger of everything a routine
+read and printed would be a second copy of every repo's contents.
+
+It runs inside the routine it observes, once per tool call, so it must never
+change that run: it prints nothing and exits 0 on every path.
+"""
+import json
+import os
+import sys
+import time
+
+LEDGER = "tool-calls.jsonl"
+LABEL_CAP = 120
+# The one input field that says what the call was for, per tool. A tool that
+# is not listed gets no label rather than a dump of its input.
+LABEL_FIELD = {
+    "Bash": "command", "Read": "file_path", "Edit": "file_path", "Write": "file_path",
+    "NotebookEdit": "notebook_path", "Glob": "pattern", "Grep": "pattern",
+    "Skill": "skill", "Agent": "description", "Task": "description",
+    "WebFetch": "url", "WebSearch": "query", "ToolSearch": "query",
+}
+PATH_FIELDS = ("file_path", "notebook_path")
+
+
+def label(tool, tool_input):
+    field = LABEL_FIELD.get(tool)
+    if not field or not isinstance(tool_input, dict):
+        return ""
+    value = str(tool_input.get(field) or "").split("\n", 1)[0]
+    if field in PATH_FIELDS:
+        return value[-LABEL_CAP:]   # the end of a path names the file
+    return value[:LABEL_CAP]
+
+
+def main():
+    if len(sys.argv) != 2:
+        return
+    event = json.loads(sys.stdin.read())
+    duration = event.get("duration_ms")
+    row = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "routine": os.environ.get("ROUTINE") or None,
+        "run_id": os.environ.get("ROUTINE_RUN_ID") or event.get("session_id"),
+        "session_id": event.get("session_id"),
+        "tool": event.get("tool_name"),
+        "duration_ms": duration if isinstance(duration, (int, float)) else None,
+        "what": label(event.get("tool_name"), event.get("tool_input")),
+    }
+    os.makedirs(sys.argv[1], exist_ok=True)
+    with open(os.path.join(sys.argv[1], LEDGER), "a") as ledger:
+        ledger.write(json.dumps(row) + "\n")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)

@@ -1,0 +1,325 @@
+#!/usr/bin/python3
+"""Per-routine spend rollup over the runs.jsonl ledger _run.sh appends to.
+
+Usage: routine-cost [--days N | --since YYYY-MM-DD] [--until YYYY-MM-DD]
+                    [--json] [--by-model] [--sends]
+
+Reads every runs*.jsonl in $METRICS_DIR — the live runs.jsonl plus any sibling
+a later import drops next to it (runs.backfill.jsonl) — and answers, per
+routine, the two questions the ledger exists for: which routine is expensive,
+and which routine is failing. `routines-status` says whether last night ran;
+this says what a month of nights cost and how the cost is distributed.
+
+Windows are whole local days and closed at BOTH ends: --days 7 is today and the
+six days before it, --since and --until name the bounds explicitly. The upper
+bound is enforced against the row's own date, not merely assumed — a row
+stamped in the future (a clock-skewed host, or a backfill imported with the
+wrong year) would otherwise be folded into a window whose own header says it
+ends today. Only the YYYY-MM-DD prefix of a row's `ts` is compared: _run.sh
+writes a local human stamp ("2026-09-03 18:07:12 CEST") and telegram-send
+writes ISO-8601 with an offset, and the date prefix is the one thing the two
+formats share.
+
+Rows whose cost_usd is null — a watchdog kill, where the CLI was killed before
+it could emit the envelope its own spend is computed from — count toward runs
+and toward the timeout column, but stay out of total/med/p95/max. A killed run
+did spend money; the ledger just does not know how much, and folding it in as
+zero would understate exactly the runs that ran longest.
+
+The parsing convention (line at a time, errors="replace", a bad line skipped
+rather than fatal) is MIRRORED from skills/daily-summary/scripts/spend-today's
+rows_for(), not imported: rows_for matches one date, and driving it over a
+30-day window would mean 30 full passes over a ledger that already holds months
+of runs. What it encodes is load-bearing here for the same reason — both
+ledgers are appended to by processes a watchdog can kill mid-line, so the last
+line can be truncated JSON or a half-written UTF-8 sequence, and a decode that
+raised would cost the whole window's figures over one byte.
+
+Read-only, and no third-party modules: /usr/bin/python3 is the only interpreter
+guaranteed on the pipeline host (same reason spend-today is Python, not jq).
+"""
+import argparse
+import glob
+import json
+import math
+import os
+import statistics
+import sys
+from datetime import date, timedelta
+
+DEFAULT_METRICS_DIR = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "metrics")
+DEFAULT_DAYS = 7
+
+# _run.sh sets these two subtypes; everything else in the field comes from the
+# CLI's own envelope. Named here so the columns and this comment cannot drift.
+BUDGET_SUBTYPE = "error_max_budget_usd"   # the --max-budget-usd cap tripped
+TIMEOUT_SUBTYPE = "watchdog_timeout"      # runner killed the CLI; cost unknown
+
+TOKEN_FIELDS = ("input_tokens", "output_tokens",
+                "cache_read_tokens", "cache_write_tokens")
+
+
+def iter_rows(path):
+    """Yield every parsable JSON object in `path`; see the module docstring."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict):
+                    yield row
+    except OSError:
+        return
+
+
+def in_window(row, since, until):
+    """True when the row's `ts` names a date within [since, until] inclusive.
+
+    Length-checked, not just prefix-compared: a row with a short or malformed
+    stamp must fall out of the window rather than sort into it by accident.
+    """
+    stamp = str(row.get("ts") or "")[:10]
+    return len(stamp) == 10 and since <= stamp <= until
+
+
+def number(value):
+    """float(value), or None when the field is null, absent or not a number."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def percentile(values, q):
+    """Nearest-rank percentile — the smallest sample at or above rank q.
+
+    Nearest-rank rather than an interpolating estimator because these samples
+    are small (a routine runs once a night, so a week is seven points) and an
+    interpolated p95 of seven runs reports a cost no run ever had.
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    return round(ordered[math.ceil(q * len(ordered)) - 1], 4)
+
+
+def group_key(row, by_model):
+    """The row's bucket: the models it actually used, or the routine name."""
+    if by_model:
+        models = row.get("models")
+        if isinstance(models, list) and models:
+            return ",".join(str(m) for m in models)
+        return "-"
+    return str(row.get("routine") or "unknown")
+
+
+def summarize(name, rows, sends):
+    costs, turns = [], []
+    tokens = dict.fromkeys(TOKEN_FIELDS, 0.0)
+    budget_hits = timeouts = errors = 0
+    requested = set()
+
+    for row in rows:
+        cost = number(row.get("cost_usd"))
+        if cost is not None:
+            costs.append(cost)
+        count = number(row.get("turns"))
+        if count is not None:
+            turns.append(count)
+        for field in TOKEN_FIELDS:
+            tokens[field] += number(row.get(field)) or 0.0
+        subtype = row.get("subtype")
+        if subtype == BUDGET_SUBTYPE:
+            budget_hits += 1
+        if subtype == TIMEOUT_SUBTYPE:
+            timeouts += 1
+        # Two independent failure signals: the CLI's own is_error flag, and an
+        # HTTP status it recorded. Either one alone is an error; counting the
+        # row once keeps `err` a count of runs, not of symptoms.
+        if row.get("is_error") is True or row.get("api_error_status") is not None:
+            errors += 1
+        if row.get("model_requested"):
+            requested.add(str(row["model_requested"]))
+
+    total_tokens = sum(tokens.values())
+    report = {
+        "group": name,
+        "runs": len(rows),
+        "cost_rows": len(costs),
+        "cost_usd": round(sum(costs), 4),
+        "median_usd": round(statistics.median(costs), 4) if costs else None,
+        "p95_usd": percentile(costs, 0.95),
+        "max_usd": round(max(costs), 4) if costs else None,
+        "budget_hits": budget_hits,
+        "timeouts": timeouts,
+        "errors": errors,
+        "mean_turns": round(statistics.fmean(turns), 1) if turns else None,
+        "cache_read_share": (round(tokens["cache_read_tokens"] / total_tokens, 3)
+                             if total_tokens else None),
+        "models_requested": sorted(requested),
+    }
+    if sends is not None:
+        report["sends"] = sends
+    return report
+
+
+def money(value):
+    return "-" if value is None else "%.2f" % value
+
+
+def share(value):
+    return "-" if value is None else "%.1f" % (100 * value)
+
+
+def plain(value):
+    return "-" if value is None else str(value)
+
+
+def print_table(reports, window, ledgers, by_model, show_sends):
+    total = reports[-1]
+    print("routine cost — %s (%d runs across %d ledger file(s))"
+          % (window, total["runs"], ledgers))
+    print("cost columns cover %d of %d runs: a watchdog kill (t/o) records no cost, so it"
+          % (total["cost_rows"], total["runs"]))
+    print("counts in runs but not in cost/med/p95/max. bud = budget cap tripped, "
+          "err = is_error or api_error_status.")
+    print("")
+
+    header = ("%-26s %4s %8s %7s %7s %7s %4s %4s %4s %6s %7s"
+              % ("models" if by_model else "routine", "runs", "cost", "med",
+                 "p95", "max", "bud", "t/o", "err", "turns", "cache%"))
+    if show_sends:
+        header += " %6s" % "sends"
+    print(header + "  requested")
+
+    for report in reports:
+        # A group of nothing but watchdog kills has no cost rows at all. Its
+        # sum is 0.00, but printing that would read as "this ran for free"
+        # rather than "nothing here was costed"; dash it like the other cost
+        # columns already do.
+        cost = report["cost_usd"] if report["cost_rows"] else None
+        line = ("%-26s %4d %8s %7s %7s %7s %4d %4d %4d %6s %7s"
+                % (report["group"], report["runs"], money(cost),
+                   money(report["median_usd"]), money(report["p95_usd"]),
+                   money(report["max_usd"]), report["budget_hits"],
+                   report["timeouts"], report["errors"],
+                   plain(report["mean_turns"]), share(report["cache_read_share"])))
+        if show_sends:
+            line += " %6d" % report["sends"]
+        print(line + "  " + (",".join(report["models_requested"]) or "-"))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    window = ap.add_mutually_exclusive_group()
+    window.add_argument("--days", type=int, default=DEFAULT_DAYS,
+                        help="window length in days, back from --until (default: %d)" % DEFAULT_DAYS)
+    window.add_argument("--since", metavar="YYYY-MM-DD",
+                        help="window start date instead of --days")
+    ap.add_argument("--until", metavar="YYYY-MM-DD",
+                    help="window end date, inclusive (default: today)")
+    ap.add_argument("--json", action="store_true",
+                    help="emit one JSON object per routine instead of the table")
+    ap.add_argument("--by-model", action="store_true",
+                    help="group by the models a run actually used, not by routine")
+    ap.add_argument("--sends", action="store_true",
+                    help="add a Telegram send count per group from sends.jsonl")
+    args = ap.parse_args()
+
+    # The end of the window is resolved first: --days counts back from it, so
+    # `--days 7 --until <date>` is the week ending on that date rather than a
+    # week ending today that a later bound then clips.
+    if args.until:
+        try:
+            until = date.fromisoformat(args.until)
+        except ValueError:
+            print("error: --until expects YYYY-MM-DD", file=sys.stderr)
+            return 2
+    else:
+        until = date.today()
+
+    if args.since:
+        try:
+            since = date.fromisoformat(args.since)
+        except ValueError:
+            print("error: --since expects YYYY-MM-DD", file=sys.stderr)
+            return 2
+    else:
+        if args.days < 1:
+            print("error: --days expects a positive number of days", file=sys.stderr)
+            return 2
+        since = until - timedelta(days=args.days - 1)
+
+    # An inverted window is a typo, not an empty result: reporting "no runs"
+    # for it would answer a question the caller did not ask.
+    if since > until:
+        print("error: --since %s is after --until %s" % (since, until), file=sys.stderr)
+        return 2
+    since, until = since.isoformat(), until.isoformat()
+    label = "%s..%s" % (since, until)
+
+    metrics_dir = os.environ.get("METRICS_DIR") or DEFAULT_METRICS_DIR
+    pattern = os.path.join(metrics_dir, "runs*.jsonl")
+    paths = sorted(glob.glob(pattern))
+
+    # Both "nothing to report" messages go to stderr, so --json emits an empty
+    # (still parsable) stream on stdout rather than a sentence a reader chokes
+    # on. Neither is an error: a host that has run no routine yet has nothing
+    # to say, and saying "$0.00" would claim a measurement never made.
+    if not paths:
+        print("routine-cost: no ledger found at %s" % pattern, file=sys.stderr)
+        return 0
+
+    rows = [row for path in paths for row in iter_rows(path) if in_window(row, since, until)]
+    if not rows:
+        print("routine-cost: no runs in %s (ledger: %s)" % (label, metrics_dir),
+              file=sys.stderr)
+        return 0
+
+    groups = {}
+    for row in rows:
+        groups.setdefault(group_key(row, args.by_model), []).append(row)
+
+    sends_by_group = {}
+    if args.sends:
+        # A send names its own routine, so routine grouping reads it directly.
+        # Model grouping has to go through run_id — the join _run.sh and
+        # telegram-send were given for exactly this — which means a send from a
+        # run outside the window is not attributable and is left out.
+        run_groups = {row.get("run_id"): group_key(row, args.by_model) for row in rows}
+        for row in iter_rows(os.path.join(metrics_dir, "sends.jsonl")):
+            if not in_window(row, since, until):
+                continue
+            if args.by_model:
+                key = run_groups.get(row.get("run_id"))
+            else:
+                key = str(row.get("routine") or "unknown")
+            if key is None:
+                continue
+            sends_by_group[key] = sends_by_group.get(key, 0) + 1
+
+    reports = [summarize(key, members, sends_by_group.get(key, 0) if args.sends else None)
+               for key, members in groups.items()]
+    reports.sort(key=lambda r: (-r["cost_usd"], r["group"]))
+    reports.append(summarize("TOTAL", rows,
+                             sum(sends_by_group.values()) if args.sends else None))
+
+    if args.json:
+        for report in reports:
+            print(json.dumps(report))
+    else:
+        print_table(reports, label, len(paths), args.by_model, args.sends)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

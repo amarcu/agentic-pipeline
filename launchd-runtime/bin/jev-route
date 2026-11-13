@@ -1,0 +1,251 @@
+#!/usr/bin/python3
+"""jev-route - ask Jev which model tier one approved issue needs, and log it. Shadow only.
+
+Usage: jev-route <owner/repo> <issue-number> [--run <id>] [--ledger <path>]
+
+Dispatch runs this once per planned issue, after it prints its plan. The answer
+is written down and nothing else: dispatch never changes its plan or the
+worker's model because of it. After a week or two of rows, the ledger is
+compared with how each worker run went, and only then may Jev choose.
+
+Jev (TypeSafe, https://docs.typesafe.ai) answers typed questions about a text
+in well under a second, for a fraction of a cent. It is good at quick judgments
+of meaning and bad at counting, dates and multi-step reasoning, so the
+questions below are each one plain judgment, and the code combines them.
+
+Prints one line:
+  JEV-ROUTE: repo=<r> issue=<n> run=<id> result=<ok|error|skipped> tier=<sonnet|opus|fable|->
+             worker=<model> clarity=<0-1> judgment=<0-1> breadth=<0-1> area=<a> security=<0-1>
+             minconf=<0-1> ms=<n> tokens=<n> reason=<text>
+and, unless the result is skipped, appends the same facts as one JSON row to the ledger
+(default ~/.agentic-skills/routines/logs/jev-shadow.jsonl).
+
+Exit codes: 0 for every result, so a failure can never stop dispatch; 2 for a usage error.
+
+The key: TYPESAFE_API_KEY, else the first line of TYPESAFE_API_KEY_FILE (default
+~/.config/typesafe/api-key). The file is refused when its group or others can
+read it. The key is never printed or logged.
+
+Issue text is written by agents and humans and is untrusted. Jev can be steered
+by text that argues for its own answer, which is one more reason this stays a
+log until the comparison says otherwise.
+"""
+import argparse
+import json
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+
+API_URL = os.environ.get("JEV_API_URL") or "https://api.typesafe.ai/v1/systemone"
+MODEL = os.environ.get("JEV_MODEL") or "jev-latest"
+TIMEOUT_SECONDS = 15
+# 32k tokens is Jev's limit for the state plus the longest question. Issues are
+# far shorter; the cut is only there so a pasted log cannot fail the request.
+STATE_CHAR_LIMIT = 40000
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+DEFAULT_LEDGER = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "logs", "jev-shadow.jsonl")
+GH = os.environ.get("GH_BIN") or "gh"
+
+QUESTIONS = {
+    # Every pipeline issue carries templated acceptance criteria, so "how
+    # complete is the spec" scored 1.00 on all of them. Whether a command can
+    # check the result varies, and is closer to what makes a run easy.
+    "clarity": {
+        "type": "score",
+        "instructions": "How can the acceptance criteria be checked?",
+        "criteria": [
+            "only by a person judging the result, for example how it looks or feels",
+            "mostly by reading the change",
+            "partly by running a command or test",
+            "fully by running a named command or test",
+        ],
+    },
+    "judgment": {
+        "type": "score",
+        "instructions": "How much design or product judgment does this change need, beyond following the issue?",
+        "criteria": [
+            "none: a mechanical change",
+            "a little: small local choices",
+            "some: choices about structure or behaviour",
+            "a lot: open design or product decisions",
+        ],
+    },
+    "breadth": {
+        "type": "score",
+        "instructions": "How much of the codebase does this change touch?",
+        "criteria": [
+            "one file",
+            "a few files in one area",
+            "several areas",
+            "many subsystems",
+        ],
+    },
+    "area": {
+        "type": "choice",
+        "instructions": "Which area does this change mainly touch?",
+        "criteria": {
+            "gameplay_ui": "game rules, balance, screens, menus or visuals",
+            "engine_native": "engine, rendering, native or platform code",
+            "server_backend": "servers, APIs, databases or networking",
+            "security_auth": "authentication, keys, payments or user data",
+            "build_tooling": "build scripts, CI, tools or tests",
+            "docs_data": "documentation or data files only",
+        },
+    },
+    "security": {
+        "type": "noul",
+        "instructions": "The change touches authentication, secrets, payments, or user data.",
+    },
+}
+
+
+def emit(fields):
+    order = ["repo", "issue", "run", "result", "tier", "worker", "clarity", "judgment", "breadth",
+             "area", "security", "minconf", "ms", "tokens", "reason"]
+    parts = []
+    for key in order:
+        value = fields.get(key, "-")
+        if isinstance(value, float):
+            value = "%.2f" % value
+        value = str(value).replace("\n", " ")
+        if key == "reason":
+            parts.append("reason=" + (value or "-"))
+        else:
+            parts.append("%s=%s" % (key, re.sub(r"\s+", "_", value) or "-"))
+    print("JEV-ROUTE: " + " ".join(parts))
+
+
+def read_key():
+    key = os.environ.get("TYPESAFE_API_KEY", "").strip()
+    if key:
+        return key, None
+    path = os.environ.get("TYPESAFE_API_KEY_FILE") or os.path.expanduser("~/.config/typesafe/api-key")
+    if not os.path.isfile(path):
+        return None, "no key: set TYPESAFE_API_KEY or create %s" % path
+    if os.stat(path).st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        return None, "key file %s is readable by group or others; chmod 600 it" % path
+    with open(path) as handle:
+        key = handle.readline().strip()
+    return (key, None) if key else (None, "key file %s is empty" % path)
+
+
+def worker_model():
+    try:
+        with open(os.path.join(REPO_ROOT, "work-on-task", "SKILL.md")) as handle:
+            for line in handle:
+                if line.startswith("model:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
+
+
+def fetch_issue(repo, number):
+    proc = subprocess.run([GH, "issue", "view", str(number), "--repo", repo, "--json", "title,body,labels"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError("gh issue view exit %d" % proc.returncode)
+    data = json.loads(proc.stdout)
+    labels = ", ".join(label.get("name", "") for label in data.get("labels") or [])
+    state = "Title: %s\nLabels: %s\n\n%s" % (data.get("title", ""), labels, data.get("body") or "")
+    if len(state) > STATE_CHAR_LIMIT:
+        state = state[:STATE_CHAR_LIMIT] + "\n[truncated]"
+    return state
+
+
+def ask(key, state):
+    body = json.dumps({"model": MODEL, "state": state, "questions": QUESTIONS}).encode("utf-8")
+    request = urllib.request.Request(API_URL, data=body, method="POST", headers={
+        "Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def normalized(answer):
+    # A score is probability-weighted over the levels its legend numbers, so it
+    # is placed on 0-1 from the legend's own range rather than an assumed one.
+    levels = sorted(int(k) for k in (answer.get("legend") or {}).keys())
+    if len(levels) < 2:
+        raise ValueError("score answer without a legend")
+    low, high = levels[0], levels[-1]
+    return (float(answer["score"]) - low) / (high - low)
+
+
+def decide(answers):
+    clarity = normalized(answers["clarity"])
+    judgment = normalized(answers["judgment"])
+    breadth = normalized(answers["breadth"])
+    security = float(answers["security"]["noul"])
+    area = answers["area"]["choice"]
+    minconf = min(float(answers[q]["confidence"]) for q in ("clarity", "judgment", "breadth", "area"))
+    if judgment >= 0.75:
+        tier, why = "fable", "open design or product decisions"
+    elif clarity >= 0.6 and judgment <= 0.35 and breadth <= 0.4 and security < 0.5 and area != "security_auth":
+        tier, why = "sonnet", "clear, local, mechanical"
+    else:
+        tier, why = "opus", "default"
+    if tier == "sonnet" and minconf < 0.6:
+        tier, why = "opus", "low confidence, so the stronger model"
+    return {"tier": tier, "clarity": clarity, "judgment": judgment, "breadth": breadth,
+            "area": area, "security": security, "minconf": minconf, "reason": why}
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=True)
+    parser.add_argument("repo")
+    parser.add_argument("issue")
+    parser.add_argument("--run", default="-")
+    parser.add_argument("--ledger", default=DEFAULT_LEDGER)
+    args = parser.parse_args()
+    if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", args.repo) or not args.issue.isdigit():
+        print("usage: jev-route <owner/repo> <issue-number> [--run <id>] [--ledger <path>]", file=sys.stderr)
+        return 2
+
+    fields = {"repo": args.repo, "issue": args.issue, "run": args.run, "worker": worker_model()}
+    key, problem = read_key()
+    if problem:
+        fields.update(result="skipped", reason=problem)
+        emit(fields)
+        return 0
+
+    started = time.time()
+    raw_answers = None
+    try:
+        state = fetch_issue(args.repo, args.issue)
+        response = ask(key, state)
+        fields.update(decide(response["answers"]))
+        # The raw answers go to the ledger so decide()'s thresholds can be
+        # re-tuned from it later without asking Jev again.
+        raw_answers = response["answers"]
+        fields["tokens"] = (response.get("usage") or {}).get("input_tokens", "-")
+        fields["result"] = "ok"
+    except urllib.error.HTTPError as err:
+        fields.update(result="error", reason="Jev HTTP %d" % err.code)
+    except (urllib.error.URLError, OSError) as err:
+        fields.update(result="error", reason="Jev unreachable: %s" % getattr(err, "reason", err))
+    except (RuntimeError, ValueError, KeyError, TypeError) as err:
+        fields.update(result="error", reason="%s: %s" % (type(err).__name__, err))
+    fields["ms"] = int((time.time() - started) * 1000)
+    emit(fields)
+
+    row = dict(fields)
+    row["answers"] = raw_answers
+    row["ts"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        os.makedirs(os.path.dirname(args.ledger), exist_ok=True)
+        with open(args.ledger, "a") as handle:
+            handle.write(json.dumps(row, sort_keys=True) + "\n")
+    except OSError as err:
+        print("jev-route: could not append to %s: %s" % (args.ledger, err), file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

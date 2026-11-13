@@ -1,0 +1,1389 @@
+#!/bin/bash
+# cursor-review — review one pull request with Cursor, so that Claude is not
+# reviewing Claude.
+#
+# The author, the reviewer and the verify gate of every PR in this pipeline
+# have been the same model on the same account. `pr-review-bundle` removes the
+# author's FRAMING from the reviewer's input; it cannot remove the author's
+# PRIORS, because the reviewer is the model that wrote the code. This script is
+# the other half: the same protocol, executed by a different vendor's model
+# through the Cursor CLI. `skills/review-pr/references/review-protocol.md` was written
+# model-agnostic for exactly this lane, and is the prompt's payload.
+#
+# What it does: builds the isolated bundle by calling pr-review-bundle; runs
+# the repository's verify gate in that bundle's src/ tree and records it in
+# gate.json, because the reviewer cannot run commands; hands the bundle and the
+# protocol to cursor-agent in read-only ask mode; parses and records the
+# verdict JSON that comes back; and, with --post, leaves the findings on the
+# pull request as one review with inline threads, so the trail of what was said
+# and what was fixed lives on the PR and not only in a metrics file.
+#
+# Two independence rules, both enforced rather than documented:
+#
+#   1. The resolved model must not be an Anthropic one. `--list-models` on this
+#      plan offers claude-opus-5-*, claude-sonnet-5-* and claude-fable-5-*
+#      beside everything else, and picking one silently turns this lane back
+#      into Claude reviewing Claude. Any id matching CLAUDE_MODEL_RE is
+#      refused, and the id that did run is recorded in the verdict and in the
+#      posted review's marker.
+#   2. `--mode ask` only. The reviewer reads and reasons; it never edits.
+#
+# Those two are also what licenses this script to pass `--allow-pipeline` to
+# pr-review-bundle. That flag lifts the bundler's refusal to bundle a PR that
+# modifies the pipeline itself — a refusal that is right for `review-pr`, where
+# Claude would be judging its own guardrails, and wrong here, where a change to
+# the guardrails is exactly what deserves an outside reader. The flag is set
+# only AFTER the model check has passed, so the guarantee is single: a Claude
+# model exits before the bundler is ever called with it.
+#
+# `--trust` IS passed, and is not a contradiction of rule 2. cursor-agent
+# refuses to work in a directory it has not seen before: it prints a "Workspace
+# Trust Required" block and exits with no JSON at all, whatever --output-format
+# says, and every bundle directory is new. Trust grants the workspace, not the
+# right to change it — that is cursor-agent's own --force/--yolo, which this
+# script never passes and which a unit test and a static test both pin.
+#
+# Auth: CURSOR_API_KEY, else the first line of CURSOR_API_KEY_FILE (default
+# ~/.config/cursor/api-key), which is refused if it is group- or world-
+# readable. The key is placed in cursor-agent's environment only — never in an
+# argument, never in the log, never echoed — and is stripped from the verify
+# gate's environment, which runs a command this repository did not write.
+#
+# Cost: the CLI reports token counts and no dollar figure (Cursor prices a
+# request server-side), so the line says `cost=unknown` and carries the four
+# token counts and the request id instead, which is what a later reconciliation
+# against the Cursor dashboard can actually key on.
+#
+# Posting, when --post is given: ONE review per round, `event=COMMENT` only.
+# Never APPROVE, never REQUEST_CHANGES, never `gh pr ready`, never a merge — a
+# passing verdict is posted as a comment saying it passed, and the human
+# merges. Everything posts under the repository owner's own GitHub login, so
+# the review body's first line is a marker naming the model and the verdict,
+# and that marker is the only thing that tells a Cursor review apart from one
+# the human wrote.
+#
+# A finding that cannot be anchored to a diff line — no usable path/line, or a
+# 422 on the anchors — is not left in the review body alone. Since PR #36
+# skills/iterate-on-pr/scripts/pr-feedback classifies EVERY lane summary as `reviewer`
+# and skips it as `reviewer-summary` context, so a body-only finding is read and
+# never acted on. Those findings go up as ONE additional pull-request comment
+# carrying each finding's tag, which pr-feedback keeps actionable, and the line
+# says `unanchored=<n>` for how many travelled that way.
+#
+# Usage: cursor-review <owner/repo> <pr> [--model <id>] [--post] [--force]
+#                      [--dry-run] [--json]
+#
+#   --model <id>   override the model for this run
+#   --post         post the findings to the pull request (default: off)
+#   --force        post again even though a review for this head SHA already
+#                  exists, and run even when the reviews already on the pull
+#                  request cannot be read. cursor-review's OWN flag; it is never
+#                  passed to cursor-agent, where --force means "apply your edits".
+#   --dry-run      build the bundle, assemble the prompt, print the model and
+#                  the prompt's first 40 lines, and — with --post — the review
+#                  it would post. Invokes nothing, writes no verdict, posts
+#                  nothing.
+#   --json         put the verdict JSON on stdout and the summary line on
+#                  stderr, so the output can be piped
+#
+# Exit codes:
+#   0  a verdict was produced (pass, changes-needed or escalate)
+#   2  usage error, a dependency is missing, or the reviews already on the pull
+#      request could not be read (see --force)
+#   3  the PR is not open            — pr-review-bundle's, propagated
+#   5  no usable API key
+#   6  the resolved model is an Anthropic one, or empty
+#   7  the round would exceed REVIEW_ROUND_MAX
+#   8  cursor-agent failed, or its answer carried no parsable verdict
+#   9  the verdict was produced but the review could not be posted
+#
+# pr-review-bundle's exit 4 (the PR modifies the pipeline) cannot reach here:
+# this script always passes --allow-pipeline. Its advisory exits — 5 (the PR
+# closes no issue) and 6 (the issue carries no acceptance criteria) — are
+# absorbed: the bundle is complete in both cases and the review runs against
+# the diff alone.
+
+set -euo pipefail
+
+# Cursor's own first-party pool on an individual plan is far larger than the
+# metered third-party pool that the GPT and Gemini ids draw from, so the
+# default is the strongest non-Anthropic model inside it. `cursor-grok-4.6-xhigh`
+# is the same model at a deeper reasoning setting — pass --model for a PR that
+# warrants the spend.
+DEFAULT_MODEL="cursor-grok-4.6-high"
+
+# A model id matching this puts Claude back on both sides of the review.
+CLAUDE_MODEL_RE='claude|anthropic|opus|sonnet|haiku|fable'
+
+usage() {
+    echo "usage: cursor-review <owner/repo> <pr> [--model <id>] [--post] [--force] [--dry-run] [--json]" >&2
+    exit 2
+}
+
+REPO=""
+PR=""
+MODEL=""
+DRY_RUN=0
+JSON_OUT=0
+POST=0
+REPOST=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --model)   MODEL="${2:-}"; [[ -n "$MODEL" ]] || usage; shift 2 ;;
+        --post)    POST=1; shift ;;
+        --force)   REPOST=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --json)    JSON_OUT=1; shift ;;
+        -h|--help) usage ;;
+        -*)        echo "cursor-review: unknown option $1" >&2; usage ;;
+        *)
+            if [[ -z "$REPO" ]]; then REPO="$1"
+            elif [[ -z "$PR" ]]; then PR="$1"
+            else usage
+            fi
+            shift ;;
+    esac
+done
+
+[[ -n "$REPO" && -n "$PR" ]] || usage
+[[ "$REPO" == */* ]] || { echo "cursor-review: repo must be <owner>/<name>, got '$REPO'" >&2; exit 2; }
+[[ "$PR" =~ ^[0-9]+$ ]] || { echo "cursor-review: pr must be a number, got '$PR'" >&2; exit 2; }
+
+OWNER="${REPO%%/*}"
+NAME="${REPO##*/}"
+
+BIN_DIR="$(cd "$(/usr/bin/dirname "$0")" && pwd)"
+RUNTIME_DIR="$(cd "$BIN_DIR/.." && pwd)"
+SKILLS_ROOT="$(cd "$RUNTIME_DIR/.." && pwd)"
+PROTOCOL="$SKILLS_ROOT/skills/review-pr/references/review-protocol.md"
+BUNDLER="$BIN_DIR/pr-review-bundle"
+METRICS_DIR="${METRICS_DIR:-${AGENTIC_SKILLS_HOME:-$HOME/.agentic-skills}/routines/metrics}"
+
+# A separate bundle directory from review-pr's: both lanes write verdict.json
+# at the bundle root, and sharing one directory would have each overwrite the
+# other's verdict. The override exists so the tests do not have to reach into
+# the real /tmp path.
+BUNDLE_DIR="${CURSOR_REVIEW_BUNDLE_DIR:-/tmp/review-${REPO//\//-}-${PR}-cursor}"
+
+CURSOR_AGENT="${CURSOR_AGENT:-$(command -v cursor-agent || echo "$HOME/.local/bin/cursor-agent")}"
+[[ -x "$CURSOR_AGENT" ]] || { echo "cursor-review: cursor-agent not found at $CURSOR_AGENT" >&2; exit 2; }
+[[ -x "$BUNDLER" ]] || { echo "cursor-review: pr-review-bundle not found at $BUNDLER" >&2; exit 2; }
+[[ -f "$PROTOCOL" ]] || { echo "cursor-review: review protocol not found at $PROTOCOL" >&2; exit 2; }
+
+# Resolved always: --post needs it, and so does reading the replies on a prior
+# round's finding threads. Only --post requires it to exist.
+GH=$(command -v gh || echo "$HOME/.local/bin/gh")
+if [[ "$POST" -eq 1 ]]; then
+    [[ -x "$GH" ]] || { echo "cursor-review: --post needs gh, not found at $GH" >&2; exit 2; }
+fi
+
+# ── The model ─────────────────────────────────────────────────────────────
+
+MODEL="${MODEL:-${CURSOR_REVIEW_MODEL:-$DEFAULT_MODEL}}"
+if [[ -z "$MODEL" ]]; then
+    echo "cursor-review: no model resolved — pass --model or set CURSOR_REVIEW_MODEL" >&2
+    exit 6
+fi
+if printf '%s' "$MODEL" | /usr/bin/grep -qiE "$CLAUDE_MODEL_RE"; then
+    echo "cursor-review: refusing model '$MODEL' — it names an Anthropic model, and this" >&2
+    echo "  lane exists so that the reviewer is not the model that wrote the code." >&2
+    exit 6
+fi
+
+# Set here and nowhere earlier. Handing pr-review-bundle a pipeline PR is safe
+# only because the reviewer is not Claude, and the line above is what proves
+# it: a Claude id has already exited 6 and never reaches this assignment.
+ALLOW_PIPELINE="--allow-pipeline"
+
+# ── The key ───────────────────────────────────────────────────────────────
+
+api_key="${CURSOR_API_KEY:-}"
+if [[ -z "$api_key" ]]; then
+    key_file="${CURSOR_API_KEY_FILE:-$HOME/.config/cursor/api-key}"
+    if [[ ! -f "$key_file" ]]; then
+        echo "cursor-review: no API key — CURSOR_API_KEY is unset and $key_file does not exist." >&2
+        echo "  Create a User API Key in the Cursor dashboard (Integrations), then:" >&2
+        echo "    mkdir -p \"\$(dirname \"$key_file\")\" && umask 077 && cat > \"$key_file\"" >&2
+        exit 5
+    fi
+    key_mode=$(/usr/bin/stat -f '%Lp' "$key_file")
+    if [[ $((8#$key_mode & 8#077)) -ne 0 ]]; then
+        echo "cursor-review: $key_file is mode $key_mode — group- or world-readable." >&2
+        echo "  An API key readable by anyone else is not a secret. chmod 600 it." >&2
+        exit 5
+    fi
+    api_key=$(/usr/bin/head -n 1 "$key_file" | /usr/bin/tr -d '[:space:]')
+    if [[ -z "$api_key" ]]; then
+        echo "cursor-review: $key_file is empty" >&2
+        exit 5
+    fi
+fi
+
+if [[ -f "${REPOS_CONF:-$RUNTIME_DIR/repos.conf}" ]]; then
+    # shellcheck source=../repos.conf.example
+    . "${REPOS_CONF:-$RUNTIME_DIR/repos.conf}"
+fi
+
+# ── The bundle ────────────────────────────────────────────────────────────
+#
+# pr-review-bundle's stdout summary goes to stderr: this script's stdout is a
+# contract line and, under --json, a verdict document.
+
+bundle_status=0
+"$BUNDLER" "$REPO" "$PR" "$BUNDLE_DIR" "$ALLOW_PIPELINE" >&2 || bundle_status=$?
+case "$bundle_status" in
+    0|5|6) : ;;
+    3)     exit 3 ;;
+    *)     echo "cursor-review: pr-review-bundle failed (exit $bundle_status)" >&2; exit 2 ;;
+esac
+
+HEAD_SHA=$(/usr/bin/python3 -c \
+    'import json,sys; print(json.load(open(sys.argv[1]))["bundle"]["head_sha"])' \
+    "$BUNDLE_DIR/meta.json")
+SHA7="${HEAD_SHA:0:7}"
+
+WORK=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/cursor-review.XXXXXX")
+# src/ goes too once a real run ends: the gate builds in it, and a Unity gate
+# left 3.7 GB per PR in /tmp until the disk filled (2026-10-14). The small files
+# stay — `--dry-run --post` renders the last verdict.json — and the next round
+# exports a fresh src/. A dry run keeps src/ so a person can inspect the bundle.
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    trap '/bin/rm -rf "$WORK"' EXIT
+else
+    trap '/bin/rm -rf "$WORK" "${BUNDLE_DIR:?}/src"' EXIT
+fi
+
+# ── The round, and whether this commit was already reviewed ───────────────
+#
+# The round is this lane's own: it counts the verdicts cursor-review has
+# already recorded for this PR, not review-pr's `review-round-<N>` labels. The
+# two lanes read the same protocol but neither gates the other, and this one
+# never touches the PR's labels. When --post is on, the PR's own markers are
+# the durable half of that count and win over the local metrics files.
+
+ROUND=1
+if [[ -d "$METRICS_DIR" ]]; then
+    for prior in "$METRICS_DIR/review-${OWNER}-${NAME}-${PR}-cursor-r"*.json; do
+        [[ -f "$prior" ]] || continue
+        n="${prior##*-cursor-r}"
+        n="${n%.json}"
+        if [[ "$n" =~ ^[0-9]+$ && "$n" -ge "$ROUND" ]]; then
+            ROUND=$((n + 1))
+        fi
+    done
+fi
+
+already_posted=0
+if [[ "$POST" -eq 1 ]]; then
+    # This is the one call that decides whether the run pays for a review, so it
+    # is not allowed to fail quietly. What is trusted here is gh's EXIT STATUS,
+    # never the emptiness of its output: a pull request nobody has reviewed
+    # answers with nothing and status 0, and a call that never ran answers with
+    # nothing too. Reading the second as the first is what spends the Cursor
+    # allowance twice and puts a duplicate review on the pull request.
+    reviews_err="$WORK/reviews.err"
+    reviews_status=0
+    prior_bodies=$("$GH" api "repos/$REPO/pulls/$PR/reviews" --paginate \
+        --jq '.[].body' 2>"$reviews_err") || reviews_status=$?
+    if [[ "$reviews_status" -ne 0 ]]; then
+        echo "cursor-review: could not read the reviews already on $REPO#$PR (gh exit $reviews_status)" >&2
+        /usr/bin/sed 's/^/  /' "$reviews_err" >&2
+        if [[ "$REPOST" -eq 0 ]]; then
+            echo "  Refusing to run. Without that answer this cannot tell a new commit from" >&2
+            echo "  one it has already paid to review, and guessing costs a duplicate review" >&2
+            echo "  on every repeat. Pass --force to review anyway." >&2
+            exit 2
+        fi
+        # --force already says "post again regardless", so the answer gates
+        # nothing here. Only the round number degrades, to the local count.
+        echo "  --force is set, so the review runs anyway and the round number comes from" >&2
+        echo "  the local metrics files alone." >&2
+        prior_bodies=""
+    fi
+    while IFS= read -r bodyline; do
+        [[ "$bodyline" == *"<!-- cursor-review "* ]] || continue
+        if [[ "$bodyline" =~ head=([0-9a-fA-F]+) && "${BASH_REMATCH[1]}" == "$HEAD_SHA" ]]; then
+            already_posted=1
+        fi
+        if [[ "$bodyline" =~ round=([0-9]+) && "${BASH_REMATCH[1]}" -ge "$ROUND" ]]; then
+            ROUND=$((BASH_REMATCH[1] + 1))
+        fi
+    done <<< "$prior_bodies"
+
+    if [[ "$already_posted" -eq 1 && "$REPOST" -eq 0 ]]; then
+        echo "CURSOR REVIEW: run=${ROUTINE_RUN_ID:-interactive} repo=$REPO pr=$PR round=$ROUND model=$MODEL already-posted head=$SHA7"
+        exit 0
+    fi
+fi
+
+if [[ -n "${REVIEW_ROUND_MAX:-}" && "$ROUND" -gt "$REVIEW_ROUND_MAX" ]]; then
+    echo "cursor-review: $REPO#$PR is at round $ROUND, past REVIEW_ROUND_MAX=$REVIEW_ROUND_MAX" >&2
+    exit 7
+fi
+
+new_cap="${REVIEW_NEW_FINDINGS_BY_ROUND[$((ROUND - 1))]:-unset}"
+life_cap="${REVIEW_FINDINGS_MAX:-unset}"
+round_max="${REVIEW_ROUND_MAX:-unset}"
+
+# ── The review body ───────────────────────────────────────────────────────
+#
+# Rendered from verdict.json alone, so --dry-run can show the exact post for a
+# verdict this lane already produced, and so the rendering is testable without
+# a reviewer. Writes the payload gh will send, plus the fallback payload for
+# the case where GitHub rejects the line anchors.
+render_post() {
+    /usr/bin/python3 - "$@" <<'PY'
+import json, os, sys
+
+(verdict_path, payload_path, fallback_path, round_max, comment_path,
+ fallback_comment_path, count_path) = sys.argv[1:8]
+v = json.load(open(verdict_path))
+
+repo, pr, rnd = v["repo"], v["pr"], v["round"]
+head, model, verdict = v["head_sha"], v["model"], v["verdict"]
+reason = v.get("reason") or "(no reason given)"
+gate = v.get("gate") if isinstance(v.get("gate"), dict) else {}
+cursor = v.get("cursor") if isinstance(v.get("cursor"), dict) else {}
+counts = v.get("open") if isinstance(v.get("open"), dict) else {}
+findings = [f for f in (v.get("findings") or []) if isinstance(f, dict)]
+
+marker = ("<!-- cursor-review repo=%s pr=%s round=%s head=%s model=%s "
+          "verdict=%s request_id=%s -->"
+          % (repo, pr, rnd, head, model, verdict,
+             cursor.get("request_id") or "none"))
+attribution = ("<!-- agentic-skills: script=cursor-review repo=%s pr=%s "
+               "routine=%s run=%s model=%s -->"
+               % (repo, pr, os.environ.get("ROUTINE") or "interactive",
+                  os.environ.get("ROUTINE_RUN_ID") or "none", model))
+
+
+def tag(f):
+    return ("<!-- finding:%s severity:%s round:%s -->"
+            % (f.get("id") or "f?", f.get("severity") or "minor", rnd))
+
+
+def anchorable(f):
+    return isinstance(f.get("line"), int) and isinstance(f.get("path"), str) and f["path"]
+
+
+def state_label(f):
+    """A new finding reads as before; an adjudicated one says what the reviewer ruled."""
+    return {"still-open": " — still open", "contested": " — contested"}.get(f.get("state"), "")
+
+
+def full(f):
+    out = ["**%s — %s%s**" % (f.get("id") or "f?", f.get("severity") or "minor",
+                              state_label(f)), ""]
+    out += [f.get("claim") or "(no claim)", ""]
+    if f.get("evidence"):
+        out += ["Evidence: %s" % f["evidence"], ""]
+    if f.get("what-settles-it"):
+        out += ["What settles it: %s" % f["what-settles-it"], ""]
+    return out
+
+
+# The gate ran here, not in the reviewer's session, so the body says which
+# command produced this outcome — a reader should never have to guess.
+capped = v.get("verdict_capped") if isinstance(v.get("verdict_capped"), dict) else None
+gate_command = (gate.get("command") or "").strip().split("\n")[0]
+gate_detail = ""
+if gate_command:
+    gate_detail = " — `%s` exited %s" % (gate_command, gate.get("exit"))
+if gate.get("first_error_line"):
+    gate_detail += "\n- First error: `%s`" % gate["first_error_line"]
+
+header = [
+    marker,
+    "## Independent review by Cursor — `%s`" % model,
+    "",
+    "Produced by `%s` through the Cursor CLI. This is deliberately **not** a Claude "
+    "review: the code in this pull request, the reviewer that would otherwise read it "
+    "and the gate that checks it have all been the same model, and this lane exists so "
+    "that at least one reader of the diff is not the model that wrote it." % model,
+    "",
+    "It read an isolated bundle — the diff at `%s`, the closing issue's acceptance "
+    "criteria and the source tree at that commit — with the pull request's description, "
+    "its commit messages and every author comment withheld." % head[:7],
+    "",
+    "It posts under this repository's owner account, because that is the only account "
+    "the Cursor CLI has. The marker on the first line above is how a reader tells this "
+    "apart from a review the human wrote by hand.",
+    "",
+    "**Verdict: %s** — %s" % (verdict, reason),
+    "",
+] + ([
+    "> This verdict was **capped**. The reviewer answered `%s`, and %s, so the review "
+    "protocol does not allow a pass. Nothing about the findings below was changed."
+    % (capped.get("from"), capped.get("because")),
+    "",
+] if capped else []) + [
+    "- Gate: `%s`%s" % (gate.get("outcome") or "could-not-run", gate_detail),
+    "- Open findings: %d blocker, %d major, %d minor"
+    % (counts.get("blocker", 0), counts.get("major", 0), counts.get("minor", 0)),
+    "- Round %s of %s" % (rnd, round_max),
+    "",
+]
+
+# From round 2 the verdict carries every earlier finding with the reviewer's
+# ruling on it. One ruled fixed is closed. Posted again as a thread or a tagged
+# comment, it reaches pr-feedback as unanswered work and the fixer redoes it,
+# so it is only listed in the body, with no tag. (Issue #57.)
+open_findings = [f for f in findings if f.get("state") != "fixed"]
+fixed = [f for f in findings if f.get("state") == "fixed"]
+
+inline = [f for f in open_findings if anchorable(f)]
+in_body = [f for f in open_findings if not anchorable(f)]
+
+fixed_section = []
+if fixed:
+    fixed_section += ["### Earlier findings the reviewer marked fixed", ""]
+    for f in fixed:
+        where = f.get("path") or ""
+        if where and isinstance(f.get("line"), int):
+            where += ":%s" % f["line"]
+        fixed_section.append("- `%s` **%s**%s" % (
+            f.get("id") or "f?", f.get("severity") or "minor",
+            " — `%s`" % where if where else ""))
+    fixed_section.append("")
+
+# The tags in this index are a cross-reference to the threads, nothing more.
+# Until PR #36 their ABSENCE was the lever that kept a body actionable for
+# skills/iterate-on-pr/scripts/pr-feedback; that lever is gone, because every lane
+# summary is now classified `reviewer` and skipped as `reviewer-summary`
+# context whatever its body carries. So a finding that is not a thread is not
+# left here to be read: it goes up as its own tagged comment, rendered by
+# `comment_body` below. Duplicated feedback is a tolerable failure; a dropped
+# finding is not.
+tags_in_body = bool(inline) and not in_body
+
+body = list(header)
+if inline:
+    body.append("### Findings — posted as inline threads")
+    body.append("")
+    for f in inline:
+        line = "- `%s` **%s**%s — `%s:%s`" % (
+            f.get("id") or "f?", f.get("severity") or "minor", state_label(f),
+            f["path"], f["line"])
+        body.append(line + (" " + tag(f) if tags_in_body else ""))
+    body.append("")
+if in_body:
+    body.append("### Findings that could not be anchored to a diff line")
+    body.append("")
+    body.append("These carry no usable `path`/`line` at this commit, so they are stated "
+                "here in full rather than dropped.")
+    body.append("")
+    for f in in_body:
+        if f.get("path"):
+            body.append("In `%s`:" % f["path"])
+        body.extend(full(f))
+if not open_findings:
+    body.append("No open findings." if fixed else "No findings.")
+    body.append("")
+body.extend(fixed_section)
+body.append(attribution)
+
+fallback = list(header)
+fallback.append("### Findings")
+fallback.append("")
+fallback.append("GitHub rejected the inline anchors for this review (HTTP 422): the lines "
+                "these findings point at are not part of this pull request's diff. They are "
+                "stated here in full rather than dropped, and carry no finding tags so that "
+                "the fixer treats this comment as actionable feedback.")
+fallback.append("")
+for f in open_findings:
+    if f.get("path"):
+        fallback.append("In `%s:%s`:" % (f["path"], f.get("line", "?")))
+    fallback.extend(full(f))
+if not open_findings:
+    fallback.append("No open findings." if fixed else "No findings.")
+    fallback.append("")
+fallback.extend(fixed_section)
+fallback.append(attribution)
+
+# commit_id is not optional here. Without it GitHub attaches the review to the
+# pull request's latest commit AT POST TIME, so a head that moves while the
+# review is running gets a review of a commit nobody read — and the idempotence
+# guard, which keys on the head SHA, would then look at the wrong one.
+payload = {"event": "COMMENT", "commit_id": head, "body": "\n".join(body)}
+comments = []
+for f in inline:
+    comments.append({
+        "path": f["path"],
+        "line": f["line"],
+        "side": "RIGHT",
+        "body": "\n".join(full(f) + [tag(f)]),
+    })
+if comments:
+    payload["comments"] = comments
+json.dump(payload, open(payload_path, "w"), indent=2)
+json.dump({"event": "COMMENT", "commit_id": head, "body": "\n".join(fallback)},
+          open(fallback_path, "w"), indent=2)
+
+
+def comment_body(items, why):
+    """One comment carrying findings that are not inline threads, tagged.
+
+    The tag is what `pr-feedback` keys on to keep an item actionable, and the
+    lane marker is how it names the reviewer being answered. Both are required:
+    a comment with neither reads as a human's and can be answered with a
+    question nobody will ever read.
+    """
+    out = [marker, "",
+           "### Round %s findings that are not inline threads" % rnd, "",
+           why, ""]
+    for f in items:
+        if f.get("path"):
+            where = f["path"] + (":%s" % f["line"] if f.get("line") else "")
+            out.append("In `%s`:" % where)
+        out.extend(full(f) + [tag(f), ""])
+    out.append(attribution)
+    return "\n".join(out)
+
+
+if in_body:
+    json.dump({"body": comment_body(
+        in_body,
+        "These carry no usable `path`/`line` at this commit. They are stated here with "
+        "their tags, because the review body above is context the fixer does not act on.")},
+        open(comment_path, "w"), indent=2)
+json.dump({"body": comment_body(
+    open_findings,
+    "GitHub rejected the inline anchors for this review (HTTP 422), so the review body "
+    "states them as context only. They are repeated here with their tags, which is what "
+    "the fixer acts on.")},
+    open(fallback_comment_path, "w"), indent=2)
+with open(count_path, "w") as fh:
+    fh.write("%d %d\n" % (len(in_body), len(open_findings)))
+
+print("--- review body ---")
+print(payload["body"])
+if in_body:
+    print("--- extra comment (%d finding(s) that are not threads) ---" % len(in_body))
+    print(json.load(open(comment_path))["body"])
+print("--- inline comments (%d) ---" % len(comments))
+for c in comments:
+    print("%s:%s" % (c["path"], c["line"]))
+    for l in c["body"].split("\n"):
+        print("    " + l)
+PY
+}
+
+# ── The verify gate ───────────────────────────────────────────────────────
+#
+# review-pr's reviewer runs the repo's gate itself, because Claude has a
+# shell. This reviewer does not and cannot: --mode ask does not execute, and
+# giving it execution would mean --force, which this lane forbids. Left there,
+# every verdict would be capped at changes-needed by a gate outcome of
+# could-not-run — a lane that can never say pass is a lane nobody can act on.
+#
+# So the gate runs HERE, in the bundle's own src/ tree at the head SHA, and
+# the reviewer is handed the result to reason about instead of a hole.
+#
+# TRUST — stated plainly, because the first version of this comment understated
+# it. What happens here is that an untrusted file decides what this machine
+# executes, in a process that holds a credential.
+#
+# The command comes from src/CLAUDE.md, a file at the head SHA of the pull
+# request under review, and it is arbitrary shell running as this user. That is
+# the same trust the pipeline already extends to a repo's gate — work-on-task
+# runs it in a worktree, review-pr in this same src/ tree — but two things make
+# it sharper here, and both are now handled:
+#
+#   - The credential. The gate runs with CURSOR_API_KEY, CURSOR_AUTH_TOKEN and
+#     CURSOR_API_KEY_FILE stripped from its environment. Not a sandbox — shell
+#     running as this user can read the key file directly — but the credential
+#     is no longer handed over by default to a command that might log its own
+#     environment.
+#   - The file itself. A PR editing any CLAUDE.md is a pipeline change, because
+#     it changes what this lane executes. pr-review-bundle's self-modification
+#     guard matches CLAUDE.md for that reason, so such a PR is refused for
+#     review-pr and reaches this lane only under --allow-pipeline, with the
+#     notice recorded in the bundle.
+#
+# The exact string is recorded in gate.json, so what ran is never a question
+# afterwards. It never runs under --dry-run.
+#
+# TIMEOUT — 2400s, matching unity-gate's own GATE_TIMEOUT default in this same
+# directory. It was 600, which was never measured against a real roster and is
+# too small for at least two repos on it:
+#
+#   - strategy-game's `make test` took 1,179 s in this lane's own bundle on
+#     2026-09-14, three quarters of it in one mission-matrix suite. Under 600 it
+#     dies two thirds of the way through and records could-not-run.
+#   - StarBonk's gate command passes `--timeout 1200` to the Unity CLI, so the
+#     outer bound here was HALF the inner one it wraps. A timeout that expires
+#     before the command it is timing can legitimately finish measures nothing.
+#
+# Erring long is the cheap direction. An over-long timeout costs wall clock on a
+# gate that has genuinely hung; an over-short one manufactures could-not-run on a
+# gate that was going to pass, and could-not-run caps the verdict — so the lane
+# reports "we could not tell" for a PR that was fine. One failure mode wastes
+# minutes, the other silently withholds a verdict.
+
+GATE_JSON="$BUNDLE_DIR/gate.json"
+gate_line="not-run (dry run)"
+
+if [[ "$DRY_RUN" -eq 0 ]]; then
+    /usr/bin/python3 - "$BUNDLE_DIR" "$GATE_JSON" "${CURSOR_REVIEW_GATE_TIMEOUT:-2400}" \
+        > "$WORK/gate-line.txt" <<'PY'
+import json, os, re, subprocess, sys, time
+
+bundle, out_path, timeout = sys.argv[1], sys.argv[2], int(sys.argv[3])
+src = os.path.join(bundle, "src")
+claude_md = os.path.join(src, "CLAUDE.md")
+
+record = {"ran": False, "command": None, "exit": None,
+          "outcome": "could-not-run", "first_error_line": None,
+          "duration_s": 0.0, "reason": ""}
+
+
+def finish(line):
+    record["ran"] = record["outcome"] in ("passed", "failed")
+    json.dump(record, open(out_path, "w"), indent=2)
+    print(line)
+    sys.exit(0)
+
+
+if not os.path.isdir(src):
+    record["reason"] = "the bundle carries no src/ tree"
+    finish("could-not-run (no src/)")
+if not os.path.isfile(claude_md):
+    record["reason"] = "src/CLAUDE.md does not exist, so the repo declares no gate"
+    finish("could-not-run (no CLAUDE.md)")
+
+lines = open(claude_md, encoding="utf-8", errors="replace").read() \
+    .replace("\r\n", "\n").split("\n")
+
+# The convention puts the gate under `## Build / Verify`. Falling back to the
+# whole file keeps a repo that words the heading differently from silently
+# reporting no gate at all.
+start = next((i for i, l in enumerate(lines)
+              if re.match(r"^##\s+build\s*/\s*verify\s*$", l.strip(), re.I)), None)
+if start is None:
+    section = "\n".join(lines)
+else:
+    end = next((j for j in range(start + 1, len(lines))
+                if lines[j].startswith("## ")), len(lines))
+    section = "\n".join(lines[start:end])
+
+# A named command wins over any NO GATE wording, and the order is load-bearing
+# rather than stylistic. A substring test for "NO GATE" reported this very
+# repository as having none, because its own Build / Verify section says the
+# words while explaining that a missing jq is a broken environment and not a
+# NO GATE. StarBonk's section does the same, naming a Unity command and then a
+# NO GATE fallback for a host without the CLI. A section that names a command
+# has a gate; whether the command can run is the next question, not this one.
+block = re.search(r"```[a-zA-Z0-9]*\n(.*?)```", section, re.S)
+if not block or not block.group(1).strip():
+    if re.search(r"NO GATE\s*[\u2014\u2013-]\s*verify by reading", section, re.I):
+        record["outcome"] = "no-gate"
+        record["reason"] = "CLAUDE.md declares NO GATE — verify by reading"
+        finish("no-gate (CLAUDE.md declares no gate)")
+    record["reason"] = "the Build / Verify section names no command in a fenced block"
+    finish("could-not-run (no gate command in CLAUDE.md)")
+
+command = block.group(1).strip()
+record["command"] = command
+started = time.time()
+
+# The Cursor credential is stripped from the gate's environment. The comment
+# that stood here claimed the key was never in this environment at all, which
+# is true only when it came from the key FILE: an operator who exports
+# CURSOR_API_KEY handed it straight to an arbitrary command out of a repo's
+# CLAUDE.md. Removing it is not a sandbox — the gate is shell running as this
+# user and can read the key file itself — but it stops the credential being
+# handed over by default, to a gate that logs its environment or ships it
+# somewhere.
+SECRETS = ("CURSOR_API_KEY", "CURSOR_AUTH_TOKEN", "CURSOR_API_KEY_FILE")
+gate_env = {k: v for k, v in os.environ.items() if k not in SECRETS}
+
+try:
+    # Decoded leniently: a gate's output is whatever its tools print, and one
+    # byte that is not UTF-8 raised inside a strict decode, which turned a
+    # passing gate into could-not-run and capped the verdict (2026-09-13).
+    proc = subprocess.run(command, shell=True, cwd=src, env=gate_env,
+                          capture_output=True, encoding="utf-8", errors="replace",
+                          timeout=timeout)
+except subprocess.TimeoutExpired:
+    record["duration_s"] = round(time.time() - started, 1)
+    record["reason"] = "the gate did not finish within %ds" % timeout
+    finish("could-not-run (timed out after %ds)" % timeout)
+except Exception as exc:
+    record["duration_s"] = round(time.time() - started, 1)
+    record["reason"] = "the gate could not be started: %s" % exc
+    finish("could-not-run (could not start the gate)")
+
+record["duration_s"] = round(time.time() - started, 1)
+record["exit"] = proc.returncode
+output = (proc.stdout or "") + (proc.stderr or "")
+
+if proc.returncode == 127:
+    record["reason"] = "the gate command's tool is not present on this host (exit 127)"
+    finish("could-not-run (tool absent, exit 127)")
+
+if proc.returncode == 0:
+    record["outcome"] = "passed"
+    finish("passed (exit 0, %ss)" % record["duration_s"])
+
+# Only looked for on a failure: a passing run's output can contain the word
+# "error" in perfectly happy prose, and quoting that as evidence would be a
+# finding built on nothing.
+record["outcome"] = "failed"
+for raw in output.split("\n"):
+    if re.search(r"(?i)(\berror\b|\bfailed\b|\bfatal\b|✗)", raw):
+        record["first_error_line"] = raw.strip()[:300]
+        break
+record["reason"] = "the gate ran and reported failure"
+finish("failed (exit %d, %ss)" % (proc.returncode, record["duration_s"]))
+PY
+
+    gate_line=$(/bin/cat "$WORK/gate-line.txt")
+    echo "cursor-review: gate $gate_line" >&2
+fi
+
+# ── The prompt ────────────────────────────────────────────────────────────
+#
+# Assembled in three parts into a file, rather than a variable. The middle part
+# must not be interpolated — review-protocol.md is full of backticks, and an
+# unquoted heredoc would run them as command substitutions — and bash 3.2, the
+# /bin/bash on this host, mis-parses a quote inside a heredoc nested in $(…),
+# so every heredoc here stays at the top level.
+
+PROMPT_FILE="$WORK/prompt.md"
+
+/bin/cat > "$PROMPT_FILE" <<PROMPT_HEAD
+You are an independent code reviewer. You are not the author of this pull
+request and you must not behave like one: you have no write access here, you
+never edit a file, and you never post anything anywhere.
+
+Your review context is an isolated bundle at:
+
+  $BUNDLE_DIR
+
+  diff.patch              the unified diff at the head SHA
+  files.json              per-file hunk ranges — line numbers must anchor to these
+  tree.txt                what sits beside the changed files at that SHA
+  acceptance-criteria.md  the originating issue's acceptance criteria, and
+                          nothing else from that issue
+  src/                    the full source tree at the head SHA
+  meta.json               the pull request metadata and the bundle manifest
+  gate.json               the repository's verify gate, already run for you
+  pipeline-notice.md      present only when this PR changes the pipeline itself
+
+  Repository:   $REPO
+  Pull request: #$PR
+  Head SHA:     $HEAD_SHA
+  Verify gate:  $gate_line
+  Round:        $ROUND of $round_max
+  New findings you may raise this round: $new_cap
+  Findings allowed across this pull request's whole life: $life_cap
+
+The pull request's description, its commit messages and every author comment
+are deliberately absent from this bundle. Do not look for them and do not use
+any knowledge of them: this review exists because the author's framing is the
+thing most likely to make a reviewer agree with the author.
+
+This session is read-only and cannot run commands, so the repository's verify
+gate has already been run for you, in src/, at this head SHA. gate.json holds
+the result: "outcome" is one of passed, failed, no-gate or could-not-run, with
+the exact command, its exit code, the first error line and how long it took.
+
+Treat gate.json as authoritative. Copy its outcome into your verdict's "gate"
+block, quote it verbatim as the evidence for any finding that rests on it, and
+never claim you ran anything yourself. A "failed" outcome is a blocker on its
+own; "no-gate" and "could-not-run" cap the verdict at changes-needed, and the
+reason says which. A "passed" outcome is what it says: the gate ran in this
+tree and reported success.
+
+Each finding's "path" and "line" are used to anchor an inline comment on the
+pull request, so a line number must be one the diff actually touches at this
+head SHA. Give no line rather than a guessed one.
+
+Read the protocol that follows and execute it. Cite the checklist item number
+in every finding's claim.
+
+PROMPT_HEAD
+
+# From round 2 the protocol requires each prior finding to be adjudicated
+# fixed, still-open or contested. That was impossible to satisfy: the prompt
+# carried no prior findings and no thread replies, so a reviewer could only
+# re-review from scratch and any "fixed" it emitted was inference from the
+# diff. The findings come from this lane's own verdict files, the replies from
+# the PR's review comments, and the two are matched by finding id.
+if [[ "$ROUND" -gt 1 ]]; then
+    if [[ -x "$GH" ]]; then
+        "$GH" api "repos/$REPO/pulls/$PR/comments" --paginate --slurp \
+            > "$WORK/prior-comments.json" 2>/dev/null || : > "$WORK/prior-comments.json"
+    else
+        : > "$WORK/prior-comments.json"
+    fi
+
+    /usr/bin/python3 - "$METRICS_DIR" "$OWNER" "$NAME" "$PR" "$ROUND" \
+        "$WORK/prior-comments.json" "$WORK/prior-context.md" \
+        > "$WORK/prior-line.txt" <<'PY'
+import glob, json, os, re, sys
+
+metrics, owner, name, pr, rnd, comments_path, out_path = sys.argv[1:8]
+rnd = int(rnd)
+
+TAG = re.compile(r"<!--\s*finding:(\S+)\s+severity:(\S+)\s+round:(\d+)\s*-->")
+
+
+def strip_markers(text):
+    return re.sub(r"<!--.*?-->", "", text or "", flags=re.S).strip()
+
+
+# The findings, from this lane's own prior verdicts. Always written, one file
+# per round, so this half survives a run that never posted anything.
+findings = {}
+order = []
+for k in range(1, rnd):
+    path = os.path.join(metrics, "review-%s-%s-%s-cursor-r%d.json" % (owner, name, pr, k))
+    if not os.path.exists(path):
+        continue
+    try:
+        doc = json.load(open(path))
+    except Exception:
+        continue
+    for f in doc.get("findings") or []:
+        if not isinstance(f, dict):
+            continue
+        fid = f.get("id") or "f?"
+        if fid not in findings:
+            order.append(fid)
+        findings[fid] = {
+            "id": fid, "round": doc.get("round", k),
+            "severity": f.get("severity") or "minor",
+            "path": f.get("path"), "line": f.get("line"),
+            "claim": f.get("claim") or "", "state": f.get("state") or "new",
+            "replies": [],
+        }
+
+# The replies, from the PR's review comments. A root comment carries the
+# finding tag; anything answering it points back with in_reply_to_id.
+pages = []
+if os.path.exists(comments_path) and os.path.getsize(comments_path):
+    try:
+        pages = json.load(open(comments_path))
+    except Exception:
+        pages = []
+comments = []
+for page in pages if isinstance(pages, list) else []:
+    comments.extend(page if isinstance(page, list) else [page])
+
+roots = {}
+for c in comments:
+    if not isinstance(c, dict):
+        continue
+    m = TAG.search(c.get("body") or "")
+    if not m:
+        continue
+    fid, severity, where = m.group(1), m.group(2), int(m.group(3))
+    roots[c.get("id")] = fid
+    if fid not in findings:
+        order.append(fid)
+        findings[fid] = {"id": fid, "round": where, "severity": severity,
+                         "path": c.get("path"), "line": c.get("line") or c.get("original_line"),
+                         "claim": strip_markers(c.get("body")), "state": "new", "replies": []}
+
+for c in comments:
+    if not isinstance(c, dict):
+        continue
+    parent = c.get("in_reply_to_id")
+    if parent in roots:
+        findings[roots[parent]]["replies"].append({
+            "author": ((c.get("user") or {}).get("login")) or "someone",
+            "body": strip_markers(c.get("body")),
+        })
+
+if not findings:
+    open(out_path, "w").write("")
+    print("0 prior findings")
+    sys.exit(0)
+
+lines = [
+    "## Prior rounds on this pull request",
+    "",
+    "These are the findings you raised in earlier rounds and every reply left on",
+    "their threads. They are the only thing from outside the bundle you may use,",
+    "and the protocol requires you to adjudicate each one.",
+    "",
+]
+for fid in order:
+    f = findings[fid]
+    where = "%s:%s" % (f["path"], f["line"]) if f["path"] else "(no anchor)"
+    lines.append("### %s - %s - round %s - %s" % (fid, f["severity"], f["round"], where))
+    lines.append("")
+    lines.append(f["claim"] or "(no claim recorded)")
+    lines.append("")
+    if f["replies"]:
+        lines.append("Replies on this thread:")
+        for r in f["replies"]:
+            lines.append("")
+            lines.append("  %s said:" % r["author"])
+            for l in (r["body"] or "(empty)").split("\n"):
+                lines.append("  | " + l)
+        lines.append("")
+    else:
+        lines.append("No reply on this thread.")
+        lines.append("")
+
+open(out_path, "w").write("\n".join(lines) + "\n")
+print("%d prior finding(s), %d with replies"
+      % (len(findings), sum(1 for f in findings.values() if f["replies"])))
+PY
+
+    prior_line=$(/bin/cat "$WORK/prior-line.txt")
+    echo "cursor-review: prior rounds: $prior_line" >&2
+    if [[ -s "$WORK/prior-context.md" ]]; then
+        /bin/cat "$WORK/prior-context.md" >> "$PROMPT_FILE"
+        /bin/cat >> "$PROMPT_FILE" <<PROMPT_PRIOR
+
+Adjudicate every finding listed above. For each one, decide from the diff and
+the source in this bundle whether it is:
+
+  fixed        the change it asked for is present at this head SHA
+  still-open   it is not, and you still stand behind it
+  contested    the reply argues it was wrong, and you accept that argument
+
+Carry each of them into your findings list with that state, its original id and
+severity, and evidence for the state you chose. The per-round budget above caps
+NEW findings only; adjudicating these is required and is never squeezed out by
+it.
+PROMPT_PRIOR
+    fi
+fi
+
+echo "" >> "$PROMPT_FILE"
+echo "--- BEGIN REVIEW PROTOCOL ---" >> "$PROMPT_FILE"
+/bin/cat "$PROTOCOL" >> "$PROMPT_FILE"
+
+/bin/cat >> "$PROMPT_FILE" <<PROMPT_TAIL
+--- END REVIEW PROTOCOL ---
+
+Answer with the verdict JSON object and nothing else: no explanation before it,
+no explanation after it, no markdown fence. It must have this shape, with
+"repo", "pr", "head_sha", "round" and "model" set to the values given above:
+
+{
+  "repo": "$REPO",
+  "pr": $PR,
+  "head_sha": "$HEAD_SHA",
+  "round": $ROUND,
+  "model": "$MODEL",
+  "gate": {"outcome": "passed|failed|no-gate|could-not-run", "command": null, "exit": null},
+  "findings": [
+    {"id": "f1", "severity": "blocker|major|minor", "path": "path/at/head", "line": 42,
+     "state": "new|fixed|still-open|contested", "claim": "one sentence: what is wrong",
+     "evidence": "what you read or ran that shows it",
+     "what-settles-it": "the observation that would close it"}
+  ],
+  "open": {"blocker": 0, "major": 0, "minor": 0},
+  "verdict": "pass|changes-needed|escalate",
+  "reason": "one sentence"
+}
+
+"verdict" must be exactly one of pass, changes-needed or escalate. If you
+cannot review this pull request at all, return the object with verdict
+"escalate" and say why in "reason". Never invent a finding, and never answer
+with prose instead of the object.
+PROMPT_TAIL
+
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "cursor-review: dry run — cursor-agent is not invoked, no verdict is written, nothing is posted"
+    echo "  model:  $MODEL"
+    echo "  bundle: $BUNDLE_DIR"
+    echo "  head:   $SHA7"
+    echo "  round:  $ROUND of $round_max"
+    echo "  gate:   $gate_line"
+    echo "  prompt (first 40 lines):"
+    /usr/bin/head -40 "$PROMPT_FILE" | /usr/bin/sed 's/^/    /'
+    if [[ "$POST" -eq 1 ]]; then
+        if [[ -f "$BUNDLE_DIR/verdict.json" ]]; then
+            echo "  the review it would post, rendered from $BUNDLE_DIR/verdict.json:"
+            render_post "$BUNDLE_DIR/verdict.json" \
+                "$WORK/payload.json" "$WORK/fallback.json" "$round_max" \
+                "$WORK/comment.json" "$WORK/fallback-comment.json" \
+                "$WORK/comment.count" \
+                | /usr/bin/sed 's/^/    /'
+        else
+            echo "  no verdict exists for this bundle yet and the reviewer was not invoked,"
+            echo "  so there are no findings to render. Run without --dry-run, then repeat"
+            echo "  this command to see the exact review body for that verdict."
+        fi
+    fi
+    exit 0
+fi
+
+# ── The review ────────────────────────────────────────────────────────────
+#
+# The raw envelope is captured outside the bundle and copied in afterwards, so
+# the reviewer cannot read a half-written file inside its own workspace. stdin
+# is closed: cursor-agent otherwise waits on a terminal it does not have.
+
+raw_out="$WORK/raw.json"
+agent_err="$WORK/stderr.txt"
+PROMPT=$(/bin/cat "$PROMPT_FILE")
+
+agent_status=0
+CURSOR_API_KEY="$api_key" "$CURSOR_AGENT" \
+    -p "$PROMPT" \
+    --model "$MODEL" \
+    --mode ask \
+    --trust \
+    --output-format json \
+    --workspace "$BUNDLE_DIR" \
+    < /dev/null > "$raw_out" 2> "$agent_err" || agent_status=$?
+
+if [[ "$agent_status" -ne 0 ]]; then
+    echo "cursor-review: cursor-agent exited $agent_status" >&2
+    /usr/bin/head -c 500 "$agent_err" >&2
+    echo >&2
+fi
+
+/bin/cp "$raw_out" "$BUNDLE_DIR/cursor-agent-raw.json"
+
+# ── The verdict ───────────────────────────────────────────────────────────
+
+parse_status=0
+/usr/bin/python3 - \
+    "$raw_out" "$BUNDLE_DIR/verdict.json" "$REPO" "$PR" "$HEAD_SHA" "$ROUND" "$MODEL" \
+    "$GATE_JSON" \
+    > "$WORK/summary.tsv" <<'PY' || parse_status=$?
+import json, os, re, sys
+
+raw_path, verdict_path, repo, pr, head_sha, rnd, model, gate_path = sys.argv[1:9]
+
+# The gate result is this script's, not the reviewer's: a read-only session
+# cannot have run anything, so whatever it wrote in its "gate" block is a
+# guess at best. Overwriting it with gate.json is bookkeeping, not judgement.
+gate_record = {}
+if os.path.exists(gate_path):
+    try:
+        gate_record = json.load(open(gate_path))
+    except Exception:
+        gate_record = {}
+
+
+def gate_block():
+    return {
+        "outcome": gate_record.get("outcome") or "could-not-run",
+        "command": gate_record.get("command"),
+        "exit": gate_record.get("exit"),
+        "first_error_line": gate_record.get("first_error_line"),
+        "duration_s": gate_record.get("duration_s"),
+    }
+
+raw = ""
+if os.path.exists(raw_path):
+    raw = open(raw_path, encoding="utf-8", errors="replace").read()
+
+try:
+    envelope = json.loads(raw)
+except Exception:
+    envelope = None
+if not isinstance(envelope, dict):
+    envelope = None
+
+usage = {}
+if envelope:
+    u = envelope.get("usage")
+    if isinstance(u, dict):
+        usage = u
+
+
+def tokens(name):
+    v = usage.get(name)
+    return v if isinstance(v, int) else 0
+
+
+cursor_block = {
+    "request_id": (envelope or {}).get("request_id") or "",
+    "session_id": (envelope or {}).get("session_id") or "",
+    "duration_ms": (envelope or {}).get("duration_ms"),
+    # Cursor prices a request server-side and the CLI reports no dollar figure,
+    # so this stays null rather than being guessed from token counts.
+    "cost_usd": None,
+    "usage": {
+        "inputTokens": tokens("inputTokens"),
+        "outputTokens": tokens("outputTokens"),
+        "cacheReadTokens": tokens("cacheReadTokens"),
+        "cacheWriteTokens": tokens("cacheWriteTokens"),
+    },
+}
+
+
+def excerpt(text):
+    return " ".join((text or "").split())[:500]
+
+
+ZERO = {"blocker": 0, "major": 0, "minor": 0}
+
+
+def emit(verdict, counts):
+    print("\t".join([
+        verdict,
+        str(counts["blocker"]), str(counts["major"]), str(counts["minor"]),
+        str(cursor_block["usage"]["inputTokens"]),
+        str(cursor_block["usage"]["outputTokens"]),
+        str(cursor_block["usage"]["cacheReadTokens"]),
+        str(cursor_block["usage"]["cacheWriteTokens"]),
+        cursor_block["request_id"] or "none",
+    ]))
+
+
+def fail(reason, text):
+    # An unreadable answer is recorded as an error, never smoothed into a
+    # verdict: a lane that invents "pass" when it cannot read the reviewer is
+    # worse than no lane.
+    doc = {
+        "repo": repo, "pr": int(pr), "head_sha": head_sha, "round": int(rnd),
+        "model": model,
+        "gate": gate_block(),
+        "findings": [], "open": dict(ZERO),
+        "verdict": "error",
+        "reason": "%s: %s" % (reason, excerpt(text) or "(no output)"),
+        "cursor": cursor_block,
+    }
+    json.dump(doc, open(verdict_path, "w"), indent=2)
+    sys.stderr.write("cursor-review: %s\n" % reason)
+    sys.stderr.write("  %s\n" % (excerpt(text) or "(no output)"))
+    emit("error", ZERO)
+    sys.exit(8)
+
+
+if envelope is None:
+    fail("cursor-agent returned no JSON envelope", raw)
+
+result = envelope.get("result")
+if not isinstance(result, str) or not result.strip():
+    fail("the envelope carried no result text", raw)
+if envelope.get("is_error"):
+    fail("cursor-agent reported an error", result)
+
+
+def json_candidates(text):
+    """Every self-contained {...} run in `text`, fenced blocks first.
+
+    The result string carries the reviewer's prose before the answer — a probe
+    on 2026-09-08 returned a sentence of narration and then the finding — so
+    the object has to be extracted, never assumed to be the whole string.
+    Braces inside strings are skipped so a claim containing one cannot truncate
+    the object.
+    """
+    found = []
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.S):
+        found.append(m.group(1))
+    depth, start, in_str, esc = 0, None, False, False
+    for i, ch in enumerate(text):
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                found.append(text[start:i + 1])
+    return found
+
+
+parsed = None
+for candidate in json_candidates(result):
+    try:
+        doc = json.loads(candidate)
+    except Exception:
+        continue
+    if isinstance(doc, dict) and "verdict" in doc:
+        parsed = doc          # the last one wins: prose first, answer last
+if parsed is None:
+    fail("no verdict JSON in the reviewer's answer", result)
+
+if parsed.get("verdict") not in ("pass", "changes-needed", "escalate"):
+    fail("the reviewer's verdict is not pass, changes-needed or escalate", result)
+
+# The reviewer is trusted for its judgement, not for its bookkeeping: the
+# identifying fields are overwritten with what this run actually reviewed.
+parsed["repo"] = repo
+parsed["pr"] = int(pr)
+parsed["head_sha"] = head_sha
+parsed["round"] = int(rnd)
+parsed["model"] = model
+
+findings = parsed.get("findings")
+if not isinstance(findings, list):
+    findings = []
+parsed["findings"] = findings
+
+parsed["gate"] = gate_block()
+
+# "contested" is the reviewer conceding: the prompt defines it as "the reply
+# argues it was wrong, and you accept that argument". Counting it as open
+# capped a pass the reviewer gave on StarBonk #60 (2026-10-14) with nothing open.
+CLOSED = ("fixed", "contested")
+
+counts = parsed.get("open")
+if not (isinstance(counts, dict)
+        and all(isinstance(counts.get(k), int) for k in ZERO)):
+    counts = dict(ZERO)
+    for f in findings:
+        if not isinstance(f, dict) or f.get("state") in CLOSED:
+            continue
+        if f.get("severity") in counts:
+            counts[f["severity"]] += 1
+parsed["open"] = {k: counts[k] for k in ("blocker", "major", "minor")}
+
+# The protocol puts two conditions on `pass`: the gate reported success, AND no
+# blocker or major is open. Both were written down and left to the reviewer's
+# good faith, and neither needs judgement to check. The gate result is this
+# script's own. Whether a verdict contradicts the reviewer's OWN findings list
+# is arithmetic — the list carries a severity and a state, so "pass while a
+# blocker is not fixed" is a contradiction visible without an opinion.
+#
+# What stays with the reviewer is whether a finding is real and how severe it
+# is. What does not is whether its verdict agrees with the list it just wrote.
+cap_reasons = []
+gate_outcome = parsed["gate"]["outcome"]
+if gate_outcome != "passed":
+    cap_reasons.append("the verify gate reported %s, not passed" % gate_outcome)
+
+blocking = [f for f in findings
+            if isinstance(f, dict)
+            and f.get("severity") in ("blocker", "major")
+            and f.get("state") not in CLOSED]
+if blocking:
+    named = ", ".join("%s (%s)" % (f.get("id") or "f?", f.get("severity"))
+                      for f in blocking[:5])
+    if len(blocking) > 5:
+        named += " and %d more" % (len(blocking) - 5)
+    cap_reasons.append("%s %s %s still open"
+                       % ("finding" if len(blocking) == 1 else "findings", named,
+                          "is" if len(blocking) == 1 else "are"))
+elif parsed["open"]["blocker"] or parsed["open"]["major"]:
+    # The reviewer's own counts contradict its findings list. Believe the
+    # counts: they are the stricter of the two readings.
+    cap_reasons.append("the reviewer reported %d open blocker and %d open major"
+                       % (parsed["open"]["blocker"], parsed["open"]["major"]))
+
+if parsed["verdict"] == "pass" and cap_reasons:
+    parsed["verdict_capped"] = {
+        "from": "pass", "to": "changes-needed",
+        "because": "; ".join(cap_reasons),
+        "reviewer_reason": parsed.get("reason") or "",
+    }
+    parsed["verdict"] = "changes-needed"
+    parsed["reason"] = (
+        "Capped from pass: %s. The reviewer said: %s"
+        % ("; ".join(cap_reasons),
+           parsed["verdict_capped"]["reviewer_reason"] or "(no reason given)"))
+
+parsed["cursor"] = cursor_block
+
+json.dump(parsed, open(verdict_path, "w"), indent=2)
+emit(parsed["verdict"], parsed["open"])
+PY
+
+if [[ ! -s "$WORK/summary.tsv" ]]; then
+    echo "cursor-review: the verdict parser produced no summary line (exit $parse_status)" >&2
+    exit 8
+fi
+IFS=$'\t' read -r verdict n_block n_major n_minor tok_in tok_out tok_cr tok_cw req_id \
+    < "$WORK/summary.tsv"
+
+/bin/mkdir -p "$METRICS_DIR"
+/bin/cp "$BUNDLE_DIR/verdict.json" \
+        "$METRICS_DIR/review-${OWNER}-${NAME}-${PR}-cursor-r${ROUND}.json"
+
+# ── The trail on the pull request ─────────────────────────────────────────
+
+posted="no"
+post_status=0
+n_commented=0
+if [[ "$POST" -eq 1 && "$verdict" == "error" ]]; then
+    echo "cursor-review: not posting — the reviewer produced no readable verdict" >&2
+elif [[ "$POST" -eq 1 ]]; then
+    render_post "$BUNDLE_DIR/verdict.json" \
+        "$WORK/payload.json" "$WORK/fallback.json" "$round_max" \
+        "$WORK/comment.json" "$WORK/fallback-comment.json" \
+        "$WORK/comment.count" > /dev/null
+
+    n_unanchored=0
+    n_findings_total=0
+    if [[ -f "$WORK/comment.count" ]]; then
+        read -r n_unanchored n_findings_total < "$WORK/comment.count"
+    fi
+
+    post_out=""
+    post_rc=0
+    post_out=$("$GH" api "repos/$REPO/pulls/$PR/reviews" \
+        --method POST --input "$WORK/payload.json" 2>&1) || post_rc=$?
+
+    # GitHub answers 422 when an inline comment names a line the diff does not
+    # contain. Losing the findings to that is not an option, so the same review
+    # goes up again with them spelled out in the body.
+    if [[ "$post_rc" -ne 0 && "$post_out" == *422* ]]; then
+        echo "cursor-review: GitHub rejected the inline anchors (422) — posting the findings in the review body instead" >&2
+        post_rc=0
+        post_out=$("$GH" api "repos/$REPO/pulls/$PR/reviews" \
+            --method POST --input "$WORK/fallback.json" 2>&1) || post_rc=$?
+        posted="body"
+    else
+        posted="inline"
+    fi
+
+    if [[ "$post_rc" -ne 0 ]]; then
+        echo "cursor-review: posting the review to $REPO#$PR failed" >&2
+        printf '%s\n' "${post_out:0:500}" >&2
+        posted="failed"
+        post_status=9
+    else
+        # Whatever is not a thread goes up as one tagged comment. Without it the
+        # finding sits in a body pr-feedback skips as context, and the round
+        # closes with nobody having acted on it.
+        comment_payload=""
+        if [[ "$posted" == "body" ]]; then
+            comment_payload="$WORK/fallback-comment.json"
+            n_commented="$n_findings_total"
+        elif [[ -s "$WORK/comment.json" ]]; then
+            comment_payload="$WORK/comment.json"
+            n_commented="$n_unanchored"
+        fi
+        if [[ -n "$comment_payload" ]]; then
+            comment_out=""
+            if ! comment_out=$("$GH" api "repos/$REPO/issues/$PR/comments" \
+                    --method POST --input "$comment_payload" 2>&1); then
+                echo "cursor-review: the review went up, but the $n_commented finding(s) that are not threads did not" >&2
+                printf '%s\n' "${comment_out:0:500}" >&2
+                n_commented=0
+                post_status=9
+            fi
+        fi
+    fi
+fi
+
+line="CURSOR REVIEW: run=${ROUTINE_RUN_ID:-interactive} repo=$REPO pr=$PR round=$ROUND"
+line="$line head=$SHA7 model=$MODEL verdict=$verdict findings=$n_block/$n_major/$n_minor"
+line="$line cost=unknown tokens=$tok_in/$tok_out/$tok_cr/$tok_cw req=$req_id posted=$posted"
+line="$line unanchored=$n_commented"
+
+if [[ "$JSON_OUT" -eq 1 ]]; then
+    echo "$line" >&2
+    /bin/cat "$BUNDLE_DIR/verdict.json"
+else
+    echo "$line"
+fi
+
+if [[ "$parse_status" -ne 0 ]]; then
+    exit "$parse_status"
+fi
+exit "$post_status"

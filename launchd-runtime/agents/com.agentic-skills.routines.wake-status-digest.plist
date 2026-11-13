@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-skills.routines.wake-status-digest</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTIC_HOME__/routines/_run.sh</string>
+        <string>wake-status-digest</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-wake-status-digest.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-wake-status-digest.stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ROUTINE_TIMEOUT_SECONDS</key>
+        <string>300</string>
+        <!-- Cost capture pilot. This is the cheapest routine and it cannot
+             mutate GitHub state, so it is where the runner's new JSON output
+             path gets proven before the routines that can. Writes a per-run
+             sidecar under metrics/ plus a row in metrics/runs.jsonl and a
+             ROUTINE COST: line in the log. -->
+        <key>ROUTINE_CAPTURE_JSON</key>
+        <string>1</string>
+    </dict>
+</dict>
+</plist>

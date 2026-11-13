@@ -1,0 +1,138 @@
+#!/bin/bash
+# wake-schedule — manage Mac wake schedule pause state
+# Companion to /Library/LaunchDaemons/com.agentic-skills.wakeschedule.plist
+#
+# Usage:
+#   wake-schedule status              Show current state and queued events
+#   wake-schedule pause <duration>    Soft pause: stop scheduling new wakes
+#                                       Nd | Nh | until YYYY-MM-DD | forever
+#   wake-schedule pause-now <dur>     Hard pause: also clears existing queue (sudo)
+#   wake-schedule resume              Clear pause + refresh now (sudo)
+#   wake-schedule refresh             Manual refresh trigger (sudo)
+#
+# Pause state lives in $HOME/.wake-schedule.state — owned by user, no sudo
+# needed for soft pause/resume operations. Hard pause and refresh use sudo
+# because they manipulate the system pmset queue.
+
+set -euo pipefail
+
+STATE_FILE="$HOME/.wake-schedule.state"
+REFRESH_SCRIPT="${AGENTIC_SKILLS_HOME:-$HOME/.agentic-skills}/refresh-wake-schedule.sh"
+
+usage() {
+    cat <<'EOF'
+Usage: wake-schedule <command> [args]
+
+Commands:
+  status                Show current state and queued wake events
+  pause <duration>      Soft pause — stop the daily refresh
+                          duration: Nd | Nh | until YYYY-MM-DD | forever
+                          (existing queued wakes still fire)
+  pause-now <duration>  Hard pause — also clears existing queue (sudo)
+  resume                Clear pause and refresh now (sudo)
+  refresh               Manual refresh trigger (sudo)
+
+Examples:
+  wake-schedule status
+  wake-schedule pause 7d
+  wake-schedule pause until 2026-12-25
+  wake-schedule pause-now 1d
+  wake-schedule resume
+EOF
+}
+
+cmd="${1:-status}"
+
+case "$cmd" in
+    status)
+        if [[ -f "$STATE_FILE" ]]; then
+            val=$(/bin/cat "$STATE_FILE" | /usr/bin/head -1 | /usr/bin/tr -d '[:space:]')
+            today=$(/bin/date +%Y-%m-%d)
+
+            if [[ "$val" == "forever" ]]; then
+                echo "🔴 PAUSED indefinitely"
+            elif [[ "$today" < "$val" ]]; then
+                echo "🟡 PAUSED until $val"
+            else
+                echo "🟢 Pause expired ($val); next daemon run will resume"
+            fi
+        else
+            echo "🟢 ACTIVE — refreshing daily at 12:00"
+        fi
+        echo
+        echo "Queued wake events:"
+        /usr/bin/pmset -g sched | /usr/bin/head -20
+        ;;
+
+    pause)
+        dur="${2:-}"
+        if [[ -z "$dur" ]]; then echo "✗ Need duration"; usage; exit 1; fi
+
+        case "$dur" in
+            forever)
+                echo "forever" > "$STATE_FILE"
+                echo "✓ Paused indefinitely. Existing queue (next 7 days) will still fire."
+                echo "  Run 'wake-schedule pause-now forever' to also clear the queue."
+                ;;
+            until)
+                target="${3:-}"
+                if [[ -z "$target" ]]; then echo "✗ Usage: wake-schedule pause until YYYY-MM-DD"; exit 1; fi
+                if ! /bin/date -j -f "%Y-%m-%d" "$target" "+%Y-%m-%d" >/dev/null 2>&1; then
+                    echo "✗ Invalid date: $target (expected YYYY-MM-DD)"
+                    exit 1
+                fi
+                echo "$target" > "$STATE_FILE"
+                echo "✓ Paused until $target. Existing queue still fires."
+                ;;
+            *d)
+                days="${dur%d}"
+                if ! [[ "$days" =~ ^[0-9]+$ ]]; then echo "✗ Invalid duration: $dur"; exit 1; fi
+                target=$(/bin/date -v +${days}d +%Y-%m-%d)
+                echo "$target" > "$STATE_FILE"
+                echo "✓ Paused for $days day(s) (until $target). Existing queue still fires."
+                ;;
+            *h)
+                hours="${dur%h}"
+                if ! [[ "$hours" =~ ^[0-9]+$ ]]; then echo "✗ Invalid duration: $dur"; exit 1; fi
+                target=$(/bin/date -v +${hours}H +%Y-%m-%d)
+                echo "$target" > "$STATE_FILE"
+                echo "✓ Paused for $hours hour(s) (until ${target} EOD)."
+                ;;
+            *)
+                echo "✗ Invalid duration: '$dur' (expected Nd, Nh, until YYYY-MM-DD, or forever)"
+                exit 1
+                ;;
+        esac
+        ;;
+
+    pause-now)
+        if [[ -z "${2:-}" ]]; then echo "✗ Need duration"; usage; exit 1; fi
+        # Set pause first
+        "$0" pause "$2" "${3:-}"
+        echo
+        echo "Clearing existing wake queue (sudo required)..."
+        sudo /usr/bin/pmset schedule cancelall
+        echo "✓ Queue cleared. Mac will not wake until pause expires or you resume."
+        ;;
+
+    resume)
+        /bin/rm -f "$STATE_FILE"
+        echo "✓ Pause cleared. Refreshing queue (sudo required)..."
+        sudo "$REFRESH_SCRIPT"
+        echo "✓ Queue refreshed."
+        ;;
+
+    refresh)
+        sudo "$REFRESH_SCRIPT"
+        ;;
+
+    -h|--help|help)
+        usage
+        ;;
+
+    *)
+        echo "✗ Unknown command: $cmd"
+        usage
+        exit 1
+        ;;
+esac

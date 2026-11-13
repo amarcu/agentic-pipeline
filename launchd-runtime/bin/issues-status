@@ -1,0 +1,355 @@
+#!/bin/bash
+# On-demand view of open issues + PRs across all tracked repos.
+# Reads the repo list from repos.conf (single source of truth).
+#
+# Usage:
+#   issues-status                                       # all repos, issues + PRs
+#   issues-status -l approved                           # only items with the `approved` label
+#   issues-status -l proposed -L approved               # awaiting human approval (proposed AND NOT approved)
+#   issues-status -L stale                              # exclude stale items
+#   issues-status --issues                              # issues only (skip PRs)
+#   issues-status --prs                                 # PRs only (skip issues)
+#   issues-status --ready-only                          # PRs ready to merge (skip drafts; implies --prs)
+#   issues-status -r acme/<repo>                      # one repo only
+#   issues-status -w starbonk                           # one workspace only (starbonk|gametwo|personal)
+#   issues-status --json                                # machine-readable, all data
+#
+# Flags:
+#   -l, --label <name>         include items with this label
+#   -L, --without-label <name> exclude items with this label
+#   -r, --repo <owner/repo>    only this repo
+#   -w, --workspace <name>     only this workspace
+#   --issues / --prs           narrow scope
+#   --ready-only               PRs only, drafts excluded (use for "merge queue")
+#   --draft-only               PRs only, non-drafts excluded (agent's WIP)
+#   --json                     emit JSON instead of formatted text
+#
+# Requires: gh CLI authenticated (gh auth status).
+# Read-only — never mutates anything.
+
+
+# jq is only at /usr/bin/jq from macOS 15 onward; resolve it so this runs on
+# an older host too. Mirrors the chain in _run.sh.
+if [[ -z "${JQ:-}" ]]; then
+    for _jq_candidate in /usr/bin/jq /opt/homebrew/bin/jq /usr/local/bin/jq "$HOME/.local/bin/jq"; do
+        [[ -x "$_jq_candidate" ]] && { JQ="$_jq_candidate"; break; }
+    done
+fi
+[[ -z "${JQ:-}" ]] && JQ=$(command -v jq 2>/dev/null || echo "")
+if [[ -z "$JQ" ]]; then
+    echo "ERROR: jq not found (looked in /usr/bin, /opt/homebrew/bin, /usr/local/bin, ~/.local/bin)." >&2
+    exit 5
+fi
+
+set -uo pipefail
+
+# Resolved beside the real script, through the symlink install.sh leaves on PATH.
+_SELF="$0"
+while [[ -L "$_SELF" ]]; do
+    _LINK=$(/usr/bin/readlink "$_SELF")
+    [[ "$_LINK" == /* ]] || _LINK="$(/usr/bin/dirname "$_SELF")/$_LINK"
+    _SELF="$_LINK"
+done
+REPOS_CONF="${REPOS_CONF:-$(/usr/bin/dirname "$_SELF")/../repos.conf}"
+if [[ ! -f "$REPOS_CONF" ]]; then
+    echo "ERROR: repos.conf not found at $REPOS_CONF" >&2
+    echo "  Copy launchd-runtime/repos.conf.example to launchd-runtime/repos.conf and list your repos." >&2
+    exit 1
+fi
+# shellcheck source=../repos.conf
+. "$REPOS_CONF"
+
+# ── Parse args ───────────────────────────────────────────────────────────
+LABEL_FILTER=""
+EXCLUDE_LABEL=""
+SHOW_ISSUES=true
+SHOW_PRS=true
+ONE_REPO=""
+ONE_WORKSPACE=""
+JSON_OUTPUT=false
+READY_ONLY=false   # --ready-only: skip draft PRs (only affects PR rows)
+DRAFT_ONLY=false   # --draft-only: only show draft PRs
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -l|--label)         LABEL_FILTER="$2"; shift 2 ;;
+        -L|--without-label) EXCLUDE_LABEL="$2"; shift 2 ;;
+        --issues)           SHOW_PRS=false; shift ;;
+        --prs)              SHOW_ISSUES=false; shift ;;
+        --ready-only)       READY_ONLY=true; SHOW_ISSUES=false; shift ;;
+        --draft-only)       DRAFT_ONLY=true; SHOW_ISSUES=false; shift ;;
+        -r|--repo)          ONE_REPO="$2"; shift 2 ;;
+        -w|--workspace)     ONE_WORKSPACE=$(echo "$2" | /usr/bin/tr '[:upper:]' '[:lower:]'); shift 2 ;;
+        --json)             JSON_OUTPUT=true; shift ;;
+        -h|--help)
+            # Print the leading comment block as help text. awk reads lines
+            # starting with '#' (but not '#!'), strips the prefix, and stops
+            # at the first non-comment line — so we can have blank-ish '#'
+            # divider lines inside the block without truncating.
+            /usr/bin/awk '/^#[^!]/{sub(/^# ?/,""); print; next} NR>1 && !/^#/{exit}' "$0"
+            exit 0 ;;
+        *)
+            echo "Unknown option: $1" >&2
+            exit 2 ;;
+    esac
+done
+
+# ── gh check ──────────────────────────────────────────────────────────────
+if ! /usr/bin/command -v gh > /dev/null; then
+    echo "ERROR: gh CLI not found. Install: brew install gh" >&2
+    exit 1
+fi
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+# days-since: print integer days since an ISO timestamp
+days_since() {
+    local ts="$1"
+    local now epoch
+    now=$(/bin/date +%s)
+    epoch=$(/bin/date -j -f "%Y-%m-%dT%H:%M:%SZ" "$ts" +%s 2>/dev/null || echo "$now")
+    echo $(( (now - epoch) / 86400 ))
+}
+
+# format_age: short age string (1d, 3d, 2w, 1mo)
+format_age() {
+    local d="$1"
+    if [[ $d -lt 1 ]]; then echo "<1d"
+    elif [[ $d -lt 14 ]]; then echo "${d}d"
+    elif [[ $d -lt 60 ]]; then echo "$((d/7))w"
+    else echo "$((d/30))mo"
+    fi
+}
+
+# Print the issue list for one repo (issues only)
+print_issues_for_repo() {
+    local repo="$1"
+    local raw json
+    raw=$(/usr/bin/env gh issue list --repo "$repo" --state open --limit 50 \
+        --json number,title,labels,createdAt,updatedAt,url 2>/dev/null) || return 0
+
+    if [[ -z "$raw" ]] || [[ "$raw" == "[]" ]]; then
+        return 0
+    fi
+
+    json=$(echo "$raw" | "$JQ" -c '.[]')
+
+    while IFS= read -r item; do
+        local num title labels updated url age label_csv
+        num=$(echo "$item" | "$JQ" -r '.number')
+        title=$(echo "$item" | "$JQ" -r '.title')
+        labels=$(echo "$item" | "$JQ" -r '[.labels[].name] | join(",")')
+        updated=$(echo "$item" | "$JQ" -r '.updatedAt')
+        url=$(echo "$item" | "$JQ" -r '.url')
+        age=$(format_age "$(days_since "$updated")")
+
+        # Apply label filter (--label X: include only items with X)
+        if [[ -n "$LABEL_FILTER" ]]; then
+            if ! echo ",$labels," | /usr/bin/grep -qE ",$LABEL_FILTER,"; then
+                continue
+            fi
+        fi
+        # Apply exclude-label filter (--without-label Y: drop items with Y)
+        if [[ -n "$EXCLUDE_LABEL" ]]; then
+            if echo ",$labels," | /usr/bin/grep -qE ",$EXCLUDE_LABEL,"; then
+                continue
+            fi
+        fi
+
+        # Truncate title to ~60 chars for terminal width
+        if [[ ${#title} -gt 58 ]]; then
+            title="${title:0:55}…"
+        fi
+
+        # Label tag (compact)
+        label_csv=""
+        [[ -n "$labels" ]] && label_csv="  [$labels]"
+
+        printf "    📋 #%-4s %-58s %4s%s\n" "$num" "$title" "$age" "$label_csv"
+        printf "       %s\n" "$url"
+    done <<< "$json"
+}
+
+# Print PR list for one repo
+print_prs_for_repo() {
+    local repo="$1"
+    local raw json
+    raw=$(/usr/bin/env gh pr list --repo "$repo" --state open --limit 20 \
+        --json number,title,labels,createdAt,updatedAt,isDraft,url 2>/dev/null) || return 0
+
+    if [[ -z "$raw" ]] || [[ "$raw" == "[]" ]]; then
+        return 0
+    fi
+
+    json=$(echo "$raw" | "$JQ" -c '.[]')
+
+    while IFS= read -r item; do
+        local num title labels updated url age is_draft tag
+        num=$(echo "$item" | "$JQ" -r '.number')
+        title=$(echo "$item" | "$JQ" -r '.title')
+        labels=$(echo "$item" | "$JQ" -r '[.labels[].name] | join(",")')
+        updated=$(echo "$item" | "$JQ" -r '.updatedAt')
+        is_draft=$(echo "$item" | "$JQ" -r '.isDraft')
+        url=$(echo "$item" | "$JQ" -r '.url')
+        age=$(format_age "$(days_since "$updated")")
+
+        # Apply label filter (--label X: include only items with X)
+        if [[ -n "$LABEL_FILTER" ]]; then
+            if ! echo ",$labels," | /usr/bin/grep -qE ",$LABEL_FILTER,"; then
+                continue
+            fi
+        fi
+        # Apply exclude-label filter (--without-label Y: drop items with Y)
+        if [[ -n "$EXCLUDE_LABEL" ]]; then
+            if echo ",$labels," | /usr/bin/grep -qE ",$EXCLUDE_LABEL,"; then
+                continue
+            fi
+        fi
+        # Apply ready-only filter (--ready-only: skip draft PRs)
+        if [[ "$READY_ONLY" == "true" ]] && [[ "$is_draft" == "true" ]]; then
+            continue
+        fi
+        # Apply draft-only filter (--draft-only: skip non-draft PRs)
+        if [[ "$DRAFT_ONLY" == "true" ]] && [[ "$is_draft" != "true" ]]; then
+            continue
+        fi
+
+        if [[ ${#title} -gt 58 ]]; then
+            title="${title:0:55}…"
+        fi
+
+        if [[ "$is_draft" == "true" ]]; then
+            tag="📝 (draft)"
+        else
+            tag="🔀 (ready) "
+        fi
+
+        printf "    %s #%-4s %-58s %4s\n" "$tag" "$num" "$title" "$age"
+        printf "       %s\n" "$url"
+    done <<< "$json"
+}
+
+# Build a single repo's report. Returns nothing printed if empty AND we're in summary mode.
+process_repo() {
+    local repo="$1"
+    local issues_out="" prs_out=""
+
+    if $SHOW_ISSUES; then
+        issues_out=$(print_issues_for_repo "$repo")
+    fi
+    if $SHOW_PRS; then
+        prs_out=$(print_prs_for_repo "$repo")
+    fi
+
+    if [[ -z "$issues_out" ]] && [[ -z "$prs_out" ]]; then
+        printf "  %-30s ─ no open work\n" "$repo"
+        TOTAL_QUIET_REPOS=$((TOTAL_QUIET_REPOS + 1))
+    else
+        printf "  %s\n" "$repo"
+        if [[ -n "$issues_out" ]]; then
+            echo "$issues_out"
+            # Count title rows only (each item has 2 lines: title + URL).
+            local n
+            n=$(echo "$issues_out" | /usr/bin/grep -c "📋")
+            TOTAL_ISSUES=$((TOTAL_ISSUES + n))
+        fi
+        if [[ -n "$prs_out" ]]; then
+            echo "$prs_out"
+            local n
+            n=$(echo "$prs_out" | /usr/bin/grep -cE "📝|🔀")
+            TOTAL_PRS=$((TOTAL_PRS + n))
+        fi
+    fi
+}
+
+# ── JSON output mode ──────────────────────────────────────────────────────
+if $JSON_OUTPUT; then
+    echo "{"
+    first_ws=true
+    for ws_entry in "${WORKSPACES[@]}"; do
+        IFS=':' read -r ws_name ws_var <<< "$ws_entry"
+        # shellcheck disable=SC2178
+        eval "ws_repos=(\"\${${ws_var}[@]}\")"
+
+        $first_ws || echo ","
+        first_ws=false
+        printf '  "%s": {\n' "$ws_name"
+
+        first_repo=true
+        for repo in "${ws_repos[@]}"; do
+            [[ -n "$ONE_REPO" ]] && [[ "$repo" != "$ONE_REPO" ]] && continue
+            $first_repo || echo ","
+            first_repo=false
+            local_issues=$(/usr/bin/env gh issue list --repo "$repo" --state open --limit 50 \
+                --json number,title,labels,createdAt,updatedAt 2>/dev/null || echo "[]")
+            local_prs=$(/usr/bin/env gh pr list --repo "$repo" --state open --limit 20 \
+                --json number,title,labels,createdAt,updatedAt,isDraft 2>/dev/null || echo "[]")
+            printf '    "%s": {"issues": %s, "prs": %s}' "$repo" "$local_issues" "$local_prs"
+        done
+        echo ""
+        echo "  }"
+    done
+    echo "}"
+    exit 0
+fi
+
+# ── Plain output mode ─────────────────────────────────────────────────────
+
+TOTAL_ISSUES=0
+TOTAL_PRS=0
+TOTAL_QUIET_REPOS=0
+
+# Header
+echo ""
+echo "issues-status — $(/bin/date '+%a %b %d %H:%M')"
+[[ -n "$LABEL_FILTER" ]] && echo "  filter: label = $LABEL_FILTER"
+[[ -n "$ONE_REPO" ]] && echo "  filter: repo = $ONE_REPO"
+[[ -n "$ONE_WORKSPACE" ]] && echo "  filter: workspace = $ONE_WORKSPACE"
+$SHOW_ISSUES || echo "  scope: PRs only"
+$SHOW_PRS || echo "  scope: issues only"
+echo ""
+
+# Walk workspaces
+for ws_entry in "${WORKSPACES[@]}"; do
+    IFS=':' read -r ws_name ws_var <<< "$ws_entry"
+
+    # Workspace filter (case-insensitive substring match)
+    if [[ -n "$ONE_WORKSPACE" ]]; then
+        ws_name_lower=$(echo "$ws_name" | /usr/bin/tr '[:upper:]' '[:lower:]')
+        if [[ "$ws_name_lower" != *"$ONE_WORKSPACE"* ]]; then
+            continue
+        fi
+    fi
+
+    # Resolve the array dynamically
+    eval "ws_repos=(\"\${${ws_var}[@]}\")"
+
+    # Skip workspace entirely if -r filter excludes every repo in it
+    if [[ -n "$ONE_REPO" ]]; then
+        ws_has_match=false
+        for repo in "${ws_repos[@]}"; do
+            [[ "$repo" == "$ONE_REPO" ]] && ws_has_match=true && break
+        done
+        $ws_has_match || continue
+    fi
+
+    echo "[$ws_name]"
+    for repo in "${ws_repos[@]}"; do
+        [[ -n "$ONE_REPO" ]] && [[ "$repo" != "$ONE_REPO" ]] && continue
+        process_repo "$repo"
+    done
+    echo ""
+done
+
+# Footer summary
+TOTAL_REPOS=0
+for ws_entry in "${WORKSPACES[@]}"; do
+    IFS=':' read -r _ ws_var <<< "$ws_entry"
+    eval "n=\${#${ws_var}[@]}"
+    TOTAL_REPOS=$((TOTAL_REPOS + n))
+done
+
+echo "──────────────────────────────────────────────────────────────"
+printf "Total: %d issues, %d PRs across %d repos (%d quiet)\n" \
+    "$TOTAL_ISSUES" "$TOTAL_PRS" "$TOTAL_REPOS" "$TOTAL_QUIET_REPOS"
+echo ""

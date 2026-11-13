@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-skills.routines.playtest-build-night</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTIC_HOME__/routines/_run.sh</string>
+        <string>playtest-build-night</string>
+    </array>
+    <!-- Monday, Wednesday and Friday at 09:00: a build to play every couple of days (the owner,
+         2026-10-17). 09:00 is after the 07:00 merge lane, which can run up to 90 minutes, so
+         the build carries that morning's merges. The work is bin/playtest-build-night, run as
+         the precheck: it exits 10 and no model starts unless the routine itself broke. -->
+    <key>StartCalendarInterval</key>
+    <array>
+        <dict>
+            <key>Weekday</key>
+            <integer>1</integer>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>3</integer>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+        <dict>
+            <key>Weekday</key>
+            <integer>5</integer>
+            <key>Hour</key>
+            <integer>9</integer>
+            <key>Minute</key>
+            <integer>0</integer>
+        </dict>
+    </array>
+    <key>StandardOutPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-playtest-build-night.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-playtest-build-night.stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ROUTINE_PRECHECK</key>
+        <string>playtest-build-night</string>
+        <!-- Two builds take about 100 s each with the warm Library and 25 minutes without it,
+             plus the smoke test and a ~130 MB upload. An hour covers the cold case. -->
+        <key>ROUTINE_PRECHECK_TIMEOUT</key>
+        <string>3600</string>
+        <key>ROUTINE_CAPTURE_JSON</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>__HOME__/.unity/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ROUTINE_TIMEOUT_SECONDS</key>
+        <string>900</string>
+        <!-- Only the failure report ever runs a model. -->
+        <key>ROUTINE_MODEL</key>
+        <string>claude-sonnet-5</string>
+        <key>ROUTINE_EFFORT</key>
+        <string>low</string>
+        <key>ROUTINE_MAX_BUDGET_USD</key>
+        <string>1.00</string>
+    </dict>
+</dict>
+</plist>

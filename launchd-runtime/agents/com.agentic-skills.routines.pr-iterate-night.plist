@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-skills.routines.pr-iterate-night</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTIC_HOME__/routines/_run.sh</string>
+        <string>pr-iterate-night</string>
+    </array>
+    <!-- 06:05, last of the three night routines. pr-review-night starts at
+         05:00 with a 3600s timeout, so 06:00 is the first moment it is
+         nominally finished; dispatch-tasks-night (04:10, 2700s) is nominally
+         finished at 04:55. All three write to the same repos, worktrees and
+         branches and _run.sh has no lock, so the prompt still checks for a
+         live dispatch and a live review before it starts: over 94 nights the
+         longest dispatch ran 8.9 hours, far past its own cap. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-pr-iterate-night.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-pr-iterate-night.stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ROUTINE_CAPTURE_JSON</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>__HOME__/.unity/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ROUTINE_TIMEOUT_SECONDS</key>
+        <string>2700</string>
+        <!-- Three PR iterations at opus/high, the per-night cap the prompt
+             sets. Sized from dispatch's measured $2.51 per task, an iteration
+             costing about the same; a runaway guard, not a target. -->
+        <key>ROUTINE_MAX_BUDGET_USD</key>
+        <string>12.00</string>
+    </dict>
+</dict>
+</plist>

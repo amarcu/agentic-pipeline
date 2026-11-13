@@ -1,0 +1,141 @@
+#!/usr/bin/python3
+"""post-review — post one review-pr review from files in its bundle.
+
+Usage: post-review <owner/repo> <pr> <bundle-dir>
+
+Reads two files the skill wrote under <bundle-dir>/review/:
+  summary.md     the review body: first line the `<!-- review-pr … -->` marker, last line the
+                 `<!-- agentic-skills: skill=review-pr … -->` attribution marker
+  findings.json  [{"path": …, "line": <int>, "body": …}, …] — each body ends with its
+                 `<!-- finding:<id> severity:<s> round:<K> -->` tag; [] when there are none
+
+Why a script. A review body is long markdown, so the model reached for `gh api … -F body=@file`,
+and the headless deny-net refuses `gh api *@*` and `gh api *--input*` — rules that stop a run from
+reading an arbitrary local file into an API call. Whether a night's review posted then depended on
+how the model phrased the command (found by the review-pr eval on 2026-09-27: one run posted, the
+next was refused twice). This script keeps that protection's intent: it reads only the two files
+inside a review bundle, refuses any other directory, and checks the markers the next round and
+iterate-on-pr depend on before anything is posted.
+
+When GitHub rejects the inline anchors (HTTP 422: a line the diff does not touch), the same review
+is posted with every finding written into the body, and the findings go up again as one issue
+comment carrying their tags. iterate-on-pr skips a review body as reviewer context and acts only on
+threads or a tagged comment, so without that comment the findings would be read by nobody.
+
+Prints `POSTED: review=<id> comments=<n> mode=<inline|body>` and exits 0, or names what is wrong and
+exits 2 (bad input, nothing posted) or 1 (GitHub refused, nothing posted).
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+BUNDLE_RE = re.compile(r"^(/private)?/tmp/review-[A-Za-z0-9_.-]+$")
+VERDICT_MARKER = re.compile(r"^<!-- review-pr repo=\S+ pr=\d+ round=\d+ head=[0-9a-f]{7,40} ")
+ATTRIBUTION = re.compile(r"^<!-- agentic-skills: skill=review-pr ")
+FINDING_TAG = re.compile(r"<!--\s*finding:\S+\s+severity:(blocker|major|minor)\s+round:\d+\s*-->\s*$")
+
+
+def fail(msg, code=2):
+    print("post-review: %s" % msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def load(bundle):
+    real = os.path.realpath(bundle)
+    if not BUNDLE_RE.match(real.rstrip("/")):
+        fail("%s is not a review bundle under /tmp/review-*; refusing to read it" % bundle)
+    summary_path = os.path.join(real, "review", "summary.md")
+    findings_path = os.path.join(real, "review", "findings.json")
+    for p in (summary_path, findings_path):
+        if os.path.realpath(p) != p or not os.path.isfile(p):
+            fail("missing or linked file: %s" % p)
+    summary = open(summary_path, encoding="utf-8").read().strip()
+    lines = summary.split("\n")
+    if not VERDICT_MARKER.match(lines[0]):
+        fail("summary.md must start with the <!-- review-pr … --> verdict marker")
+    if not ATTRIBUTION.match(lines[-1]):
+        fail("summary.md must end with the <!-- agentic-skills: skill=review-pr … --> marker")
+    try:
+        findings = json.load(open(findings_path, encoding="utf-8"))
+    except ValueError as exc:
+        fail("findings.json is not JSON: %s" % exc)
+    if not isinstance(findings, list):
+        fail("findings.json must be a list")
+    for i, f in enumerate(findings):
+        if not (isinstance(f, dict) and isinstance(f.get("path"), str) and isinstance(f.get("line"), int)
+                and isinstance(f.get("body"), str)):
+            fail("finding %d needs path (string), line (integer) and body (string)" % i)
+        if not FINDING_TAG.search(f["body"].strip()):
+            fail("finding %d must end with its <!-- finding:<id> severity:<s> round:<K> --> tag" % i)
+    return summary, findings
+
+
+def post(repo, pr, payload, endpoint="pulls/%s/reviews"):
+    gh = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as fh:
+        json.dump(payload, fh)
+        path = fh.name
+    try:
+        proc = subprocess.run([gh, "api", "repos/%s/%s" % (repo, endpoint % pr),
+                               "--method", "POST", "--input", path],
+                              capture_output=True, text=True)
+    finally:
+        os.unlink(path)
+    return proc
+
+
+def main():
+    if len(sys.argv) != 4:
+        fail("usage: post-review <owner/repo> <pr> <bundle-dir>")
+    repo, pr, bundle = sys.argv[1:4]
+    if not REPO_RE.match(repo) or not pr.isdigit():
+        fail("usage: post-review <owner/repo> <pr> <bundle-dir>")
+    summary, findings = load(bundle)
+
+    comments = [{"path": f["path"], "line": f["line"], "side": "RIGHT", "body": f["body"].strip()}
+                for f in findings]
+    payload = {"event": "COMMENT", "body": summary}
+    if comments:
+        payload["comments"] = comments
+    proc = post(repo, pr, payload)
+    mode = "inline"
+
+    if proc.returncode != 0 and "422" in (proc.stderr + proc.stdout) and comments:
+        # Anchors the diff does not touch: keep every finding by writing it into the body.
+        lines = summary.split("\n")
+        spelled = ["", "### Findings", "",
+                   "GitHub rejected the inline anchors (HTTP 422), so each finding is stated here.", ""]
+        for f in findings:
+            spelled += ["In `%s:%d`:" % (f["path"], f["line"]), "", f["body"].strip(), ""]
+        body = "\n".join(lines[:-1] + spelled + lines[-1:])
+        proc = post(repo, pr, {"event": "COMMENT", "body": body})
+        mode = "body"
+        if proc.returncode == 0:
+            # The actionable copy: a tagged comment is what iterate-on-pr reads.
+            marker = lines[0]
+            comment = [marker, "", "### Findings that are not inline threads", "",
+                       "GitHub rejected their anchors, so each is stated here with its tag.", ""]
+            for f in findings:
+                comment += ["In `%s:%d`:" % (f["path"], f["line"]), "", f["body"].strip(), ""]
+            comment.append(lines[-1])
+            tagged = post(repo, pr, {"body": "\n".join(comment)}, endpoint="issues/%s/comments")
+            if tagged.returncode != 0:
+                fail("the review posted, but the tagged findings comment did not: %s"
+                     % (tagged.stderr or tagged.stdout).strip()[:300], code=1)
+
+    if proc.returncode != 0:
+        fail("GitHub refused the review: %s" % (proc.stderr or proc.stdout).strip()[:300], code=1)
+    try:
+        review_id = json.loads(proc.stdout or "{}").get("id", "?")
+    except ValueError:
+        review_id = "?"
+    print("POSTED: review=%s comments=%d mode=%s" % (review_id, len(comments) if mode == "inline" else 0, mode))
+
+
+if __name__ == "__main__":
+    main()

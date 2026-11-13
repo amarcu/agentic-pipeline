@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":14,
+ "total_cost_usd":0.9034,"session_id":"smoke-fixture-worker-planned",
+ "permission_denials":[],
+ "result":"DISPATCH GATE: open_agent_prs=3 cap=5 per_repo=2 run_max=4 budget=2 blocked=0 at_limit=- eligible=amarcu/StarBonk\nDISPATCH PLAN: run=smoke-1757246400 1 issue(s) amarcu/StarBonk#77\nPLANNED: amarcu/StarBonk#77 4 steps\nDISPATCH: run=smoke-1757246400 repo=amarcu/StarBonk issue=77 outcome=halted gate=- pr=-\nDISPATCH END: run=smoke-1757246400 dispatched=0 halted=1 refused=0",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":11,"outputTokens":1204,
+  "cacheReadInputTokens":71002,"cacheCreationInputTokens":15330}}}

@@ -1,0 +1,32 @@
+#!/bin/bash
+# Mock cursor-agent with the surface cursor-review actually calls.
+#
+# Records the invocation to $MOCK_CURSOR_DIR/argv.txt — one argument per line,
+# so a test can assert on a flag without word-splitting a prompt full of
+# spaces — and writes env.txt saying only WHETHER the API key arrived in the
+# environment. Never the key itself: a fixture that captured a secret would be
+# the one place in this repo where one lands on disk in plain sight.
+#
+# Serves $MOCK_CURSOR_DIR/stdout.json as the envelope and exits 1 when that
+# file is absent, which is how a test exercises the "cursor-agent failed" path.
+set -u
+
+dir="${MOCK_CURSOR_DIR:?MOCK_CURSOR_DIR not set}"
+
+: > "$dir/argv.txt"
+for a in "$@"; do
+    printf '%s\n' "$a" >> "$dir/argv.txt"
+done
+
+if [[ -n "${CURSOR_API_KEY:-}" ]]; then
+    echo "key=set" > "$dir/env.txt"
+else
+    echo "key=unset" > "$dir/env.txt"
+fi
+
+if [[ ! -f "$dir/stdout.json" ]]; then
+    echo "mock cursor-agent: no canned response in $dir" >&2
+    exit 1
+fi
+
+/bin/cat "$dir/stdout.json"

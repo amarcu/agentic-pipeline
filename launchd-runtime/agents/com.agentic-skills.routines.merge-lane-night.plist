@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-skills.routines.merge-lane-night</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTIC_HOME__/routines/_run.sh</string>
+        <string>merge-lane-night</string>
+    </array>
+    <!-- 07:00, after pr-review-night (05:00) and pr-iterate-night (06:00), so Grok reviews the
+         heads the iterate run just pushed. The work is bin/merge-lane-night, run as the
+         precheck: on a normal night it exits 10 and no model starts. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>7</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-merge-lane-night.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-merge-lane-night.stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ROUTINE_PRECHECK</key>
+        <string>merge-lane-night</string>
+        <!-- Grok reviews take minutes each and unity-gate about two: 90 minutes covers three
+             PRs with room. A hung lane is killed and reported, never trusted. -->
+        <key>ROUTINE_PRECHECK_TIMEOUT</key>
+        <string>5400</string>
+        <key>ROUTINE_CAPTURE_JSON</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>__HOME__/.unity/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ROUTINE_TIMEOUT_SECONDS</key>
+        <string>900</string>
+        <!-- Only the failure report ever runs a model. -->
+        <key>ROUTINE_MODEL</key>
+        <string>claude-sonnet-5</string>
+        <key>ROUTINE_EFFORT</key>
+        <string>low</string>
+        <key>ROUTINE_MAX_BUDGET_USD</key>
+        <string>1.00</string>
+    </dict>
+</dict>
+</plist>

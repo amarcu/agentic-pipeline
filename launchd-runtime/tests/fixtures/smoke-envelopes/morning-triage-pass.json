@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":11,
+ "total_cost_usd":0.2841,"session_id":"smoke-fixture-pass",
+ "permission_denials":[],
+ "result":"Scanned 9 active repos under ROUTINE_DRY_RUN=1 — no digest sent, no escalation filed.\n\nTRIAGE: run=smoke-1757246400 repos=9 blocking=1 needs_approval=3 proposed=4 escalated=0 errors=0",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":9,"outputTokens":812,
+  "cacheReadInputTokens":48210,"cacheCreationInputTokens":9902}}}

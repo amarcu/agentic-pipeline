@@ -1,0 +1,10 @@
+#!/bin/bash
+# Mock claude-cli that records the argv it was invoked with, so tests can assert
+# on the flags the runner passes. No other fixture captures argv — they all
+# discard it. NUL-separated because --settings carries a multi-line JSON blob.
+if [[ "$1" == "--version" ]]; then echo "2.1.252 (Claude Code) [MOCK: record-argv]"; exit 0; fi
+printf '%s\0' "$@" > "${ROUTINE_DIR}/argv.bin"
+# Also the run-identifying environment the runner exports, so tests can assert
+# a skill would see it. One name=value per line; nothing else is recorded.
+printf '%s\n' "ROUTINE=${ROUTINE:-}" "ROUTINE_RUN_ID=${ROUTINE_RUN_ID:-}" > "${ROUTINE_DIR}/env.txt"
+exit 0

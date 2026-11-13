@@ -1,0 +1,23 @@
+#!/bin/bash
+# Mock claude-cli emitting a clean --output-format json envelope on stdout.
+# Token counts and cost are the real values measured on 2026-09-01
+# (docs/assessments/2026-09-01-model-routing-probe.md), so the fixture's
+# arithmetic is checkable against a known rate card.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.252 (Claude Code) [MOCK: json-success]"
+    exit 0
+fi
+
+# Narrative goes to stderr, which the runner still appends to the log.
+echo "Mock claude-cli: working..." >&2
+
+cat <<'JSON'
+{"type":"result","subtype":"success","is_error":false,"num_turns":3,
+ "total_cost_usd":0.1537645,"session_id":"mock-session-success",
+ "permission_denials":[],"result":"digest sent",
+ "modelUsage":{"claude-opus-4-8":{"inputTokens":2,"outputTokens":14,
+  "cacheReadInputTokens":10029,"cacheCreationInputTokens":14839,
+  "costUSD":0.1537645,"contextWindow":1000000}}}
+JSON
+exit 0

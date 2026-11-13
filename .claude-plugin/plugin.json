@@ -1,0 +1,35 @@
+{
+  "name": "agentic-skills",
+  "version": "1.0.0",
+  "description": "Autonomous development pipeline for Claude Code: triage, proposal, approval, implementation and PR-iteration skills that drive work across multiple repos, all inheriting one behavioural baseline.",
+  "author": {
+    "name": "Alexandru Marcu"
+  },
+  "homepage": "https://github.com/amarcu/agentic-pipeline",
+  "repository": "https://github.com/amarcu/agentic-pipeline",
+  "keywords": [
+    "automation",
+    "pipeline",
+    "skills",
+    "github",
+    "launchd"
+  ],
+  "skills": [
+    "./skills/art-director",
+    "./skills/daily-summary",
+    "./skills/dispatch-tasks",
+    "./skills/iterate-on-pr",
+    "./skills/morning-triage",
+    "./skills/notify",
+    "./skills/plan-features",
+    "./skills/propose-tasks",
+    "./skills/request-approval",
+    "./skills/review-pr",
+    "./skills/skill-assess",
+    "./skills/triage-repo",
+    "./skills/unstick",
+    "./skills/use-machine",
+    "./skills/vfx-specialist",
+    "./skills/work-on-task"
+  ]
+}

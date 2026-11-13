@@ -1,0 +1,70 @@
+#!/bin/bash
+# Show last-run status of all launchd routines.
+# Usage: routines-status                 (table view)
+#        routines-status -v <routine>    (tail the latest log for one routine)
+
+set -uo pipefail
+# NB: NOT -e — `ls` errors on no-match for routines that haven't run yet,
+# and that's expected, not a script failure.
+
+LOG_DIR="${AGENTIC_SKILLS_HOME:-$HOME/.agentic-skills}/routines/logs"
+# Ordered by schedule. Must match the installed plists exactly — the static
+# test test_routine_rosters_match_installed_plists enforces it, because a
+# routine missing here is a routine whose failure nobody sees.
+ROUTINES=(
+    "wake-status-digest"
+    "morning-triage"
+    "morning-proposals"
+    "dispatch-tasks-night"
+    "skill-assess-weekly"
+    "pr-review-night"
+    "pr-iterate-night"
+    "daily-summary-routine"
+    "daily-review-nudge"
+    "merge-lane-night"
+    "playtest-build-night"
+)
+
+# Verbose mode: tail one routine's latest log
+if [[ "${1:-}" == "-v" ]] && [[ -n "${2:-}" ]]; then
+    ROUTINE="$2"
+    LATEST=$(/bin/ls -t "$LOG_DIR/${ROUTINE}-"*.log 2>/dev/null | /usr/bin/head -1)
+    if [[ -z "$LATEST" ]]; then
+        echo "No log found for routine: $ROUTINE"
+        echo "Available logs:"
+        /bin/ls "$LOG_DIR"/*.log 2>/dev/null | /usr/bin/awk -F/ '{print $NF}' | /usr/bin/sed 's/-[0-9]\{4\}.*//' | /usr/bin/sort -u
+        exit 1
+    fi
+    echo "=== Latest log for $ROUTINE: $LATEST ==="
+    /bin/cat "$LATEST"
+    exit 0
+fi
+
+# Table view
+printf "%-25s %-22s %-6s %-8s  %s\n" "ROUTINE" "LAST RUN" "EXIT" "DUR" "LATEST LOG"
+printf "%-25s %-22s %-6s %-8s  %s\n" "-------" "--------" "----" "---" "----------"
+
+for r in "${ROUTINES[@]}"; do
+    # /bin/ls errors when no log file matches; mask stderr and tolerate non-zero
+    LATEST=$(/bin/ls -t "$LOG_DIR/${r}-"*.log 2>/dev/null | /usr/bin/head -1 || true)
+    if [[ -z "$LATEST" ]]; then
+        printf "%-25s %-22s %-6s %-8s  %s\n" "$r" "(never run)" "-" "-" "-"
+        continue
+    fi
+
+    # Find last END line; if none, find last START (in-progress)
+    LAST_END=$(/usr/bin/grep "ROUTINE END" "$LATEST" | /usr/bin/tail -1)
+    if [[ -z "$LAST_END" ]]; then
+        LAST_START=$(/usr/bin/grep "ROUTINE START" "$LATEST" | /usr/bin/tail -1)
+        TS=$(echo "$LAST_START" | /usr/bin/grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}")
+        printf "%-25s %-22s %-6s %-8s  %s\n" "$r" "${TS:-?}" "RUN" "..." "$LATEST"
+    else
+        TS=$(echo "$LAST_END" | /usr/bin/grep -oE "[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}")
+        EXIT=$(echo "$LAST_END" | /usr/bin/grep -oE "exit=[0-9]+" | /usr/bin/cut -d= -f2)
+        DUR=$(echo "$LAST_END" | /usr/bin/grep -oE "duration=[0-9]+s" | /usr/bin/cut -d= -f2)
+        printf "%-25s %-22s %-6s %-8s  %s\n" "$r" "${TS:-?}" "${EXIT:-?}" "${DUR:-?}" "$LATEST"
+    fi
+done
+
+echo ""
+echo "For details on a specific routine: routines-status -v <routine-name>"

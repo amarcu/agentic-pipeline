@@ -1,0 +1,180 @@
+#!/bin/bash
+# install-requirements — offer to install what check-requirements says is missing.
+#
+# Usage: install-requirements <owner/repo> [--dry-run]
+#
+# Reads `<repo>/agent/requirements.conf` through check-requirements --json and,
+# for each MISSING requirement, does one of two things:
+#
+#   the line carries `# install: <command>`  → print the command, then run it
+#   no `# install:`                          → print it as a MANUAL step with
+#                                              its `# hint:`, and run nothing
+#
+# What it will never do, in any mode:
+#
+#   * Run as root. It refuses outright when euid is 0, and any install command
+#     containing `sudo` is demoted to a manual step. A dependency manifest is
+#     data that travels with a repo; a repo must not be able to hand this
+#     script a root shell.
+#   * Install Xcode, or activate a Unity licence. Both are interactive,
+#     account-bound and enormous, and a half-finished attempt at either leaves
+#     a host in a worse state than the one it started in. They print as manual
+#     steps whatever the manifest says.
+#   * Install anything unattended. **When stdin is not a TTY it defaults to
+#     --dry-run**, so a routine, a cron job or a piped invocation can print the
+#     plan and nothing else. Installing is a human's decision, made at a
+#     terminal.
+#
+# Everything that ran is verified rather than assumed: the run ends by calling
+# check-requirements again and exits with its verdict (0 = nothing missing).
+# --dry-run skips the re-check and exits 1 while anything is still missing.
+#
+# A manifest check-requirements could not parse stops this before it plans
+# anything. Such a report carries no requirements at all, so a plan built from
+# it is empty — and an empty plan is indistinguishable from "nothing missing"
+# unless the status is read first. Reporting "nothing missing" over a file
+# nobody could read is the same lie the checker was fixed for.
+set -euo pipefail
+
+BIN_DIR="$(cd "$(/usr/bin/dirname "$0")" && pwd)"
+CHECK="$BIN_DIR/check-requirements"
+
+REPO=""
+DRY_RUN=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY_RUN=1 ;;
+        -*)        echo "install-requirements: unknown flag $arg" >&2; exit 2 ;;
+        *)         if [ -n "$REPO" ]; then
+                       echo "install-requirements: one repo at a time" >&2
+                       exit 2
+                   fi
+                   REPO="$arg" ;;
+    esac
+done
+[ -n "$REPO" ] || { echo "usage: install-requirements <owner/repo> [--dry-run]" >&2; exit 2; }
+[ -x "$CHECK" ] || { echo "install-requirements: no check-requirements beside me at $CHECK" >&2; exit 2; }
+
+if [ "$(/usr/bin/id -u)" -eq 0 ]; then
+    echo "install-requirements: refusing to run as root — installs go through your own user" >&2
+    exit 2
+fi
+
+# Not a TTY means nobody is there to say no. Print the plan; change nothing.
+if [ ! -t 0 ] && [ "$DRY_RUN" -eq 0 ]; then
+    DRY_RUN=1
+    echo "install-requirements: stdin is not a TTY — dry run (installs need a terminal)"
+fi
+
+# check-requirements exits 1 when something is missing, which is the normal
+# case here, and 2 on a usage or resolution error, which is not.
+set +e
+REPORT=$("$CHECK" "$REPO" --json --quiet)
+CHECK_RC=$?
+set -e
+[ "$CHECK_RC" -le 1 ] || { printf '%s\n' "$REPORT"; exit 2; }
+
+STATUS=$(printf '%s' "$REPORT" | /usr/bin/python3 -c '
+import json, sys
+row = json.loads(sys.stdin.readline())
+print("%s\t%s" % (row["status"], "; ".join(row.get("errors") or [])))
+')
+if [ "${STATUS%%$'\t'*}" = "manifest-error" ]; then
+    echo "INSTALL: $REPO manifest-error — nothing can be planned from a manifest that does not parse"
+    echo "  ${STATUS#*$'\t'}"
+    echo "  fix $REPO/agent/requirements.conf, then run this again"
+    exit 1
+fi
+
+# Install commands run FROM THE REPO ROOT, the same directory check-requirements
+# resolves a `path` requirement against. GameTwo's is
+# `git clone … ../game-engine`, which puts the engine beside the repo from there and
+# somewhere arbitrary from anywhere else.
+ROOT=$(printf '%s' "$REPORT" | /usr/bin/python3 -c '
+import json, sys
+print(json.loads(sys.stdin.readline())["path"])
+')
+
+# One record per MISSING requirement: label, install command, hint. Python
+# because the manifest's annotations already arrive as JSON and re-parsing them
+# in bash would be a second parser for one format. The separator is US (\037)
+# and not a tab: a tab is IFS whitespace, so `read` collapses two adjacent ones
+# and a requirement with no `# install:` would have its hint read as the
+# command — which is how this script first offered to run "no install command
+# here" as a shell command.
+PLAN=$(printf '%s' "$REPORT" | /usr/bin/python3 -c '
+import json, sys
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    for req in json.loads(line).get("requirements", []):
+        if req["status"] != "missing":
+            continue
+        print("\037".join(x.replace("\037", " ") for x in
+                          (req["label"], req.get("install") or "", req.get("hint") or "")))
+')
+
+if [ -z "$PLAN" ]; then
+    echo "INSTALL: $REPO nothing missing"
+    exit 0
+fi
+
+count=$(printf '%s\n' "$PLAN" | /usr/bin/grep -c .)
+if [ "$DRY_RUN" -eq 1 ]; then mode="dry-run"; else mode="run"; fi
+echo "INSTALL: $REPO mode=$mode missing=$count"
+
+ran=0
+failed=0
+manual=0
+
+while IFS=$'\037' read -r label command hint; do
+    [ -n "$label" ] || continue
+
+    reason=""
+    if [ -z "$command" ]; then
+        reason="no install command in the manifest"
+    elif printf '%s' "$command" | /usr/bin/grep -qE '(^|[^[:alnum:]])sudo([^[:alnum:]]|$)'; then
+        reason="needs root; run it yourself"
+    elif printf '%s' "$command" | /usr/bin/grep -qiE 'xcode|licen[cs]e|activate'; then
+        reason="Xcode and Unity licences are installed by a human, never by this script"
+    fi
+
+    if [ -n "$reason" ]; then
+        manual=$((manual + 1))
+        echo "  manual: $label — $reason"
+        # `if`, not `[ … ] && echo`: under `set -e` an AND-list whose test
+        # fails takes the whole script down with it.
+        if [ -n "$hint" ]; then    echo "          hint: $hint"; fi
+        if [ -n "$command" ]; then echo "          suggested: $command"; fi
+        continue
+    fi
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        echo "  would run: $command   ($label)"
+        continue
+    fi
+
+    echo "  running: $command   (in $ROOT)"
+    set +e
+    ( cd "$ROOT" && /bin/sh -c "$command" )
+    rc=$?
+    set -e
+    if [ "$rc" -eq 0 ]; then
+        ran=$((ran + 1))
+    else
+        failed=$((failed + 1))
+        echo "  FAILED (exit $rc): $command"
+        if [ -n "$hint" ]; then echo "          hint: $hint"; fi
+    fi
+done <<< "$PLAN"
+
+echo "INSTALL END: $REPO ran=$ran failed=$failed manual=$manual"
+
+if [ "$DRY_RUN" -eq 1 ]; then
+    exit 1
+fi
+
+# Verified, not assumed: a package manager can exit 0 and still leave the
+# binary off this PATH.
+"$CHECK" "$REPO" --quiet

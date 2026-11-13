@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":9,
+ "total_cost_usd":0.4419,"session_id":"smoke-fixture-no-args",
+ "permission_denials":[],
+ "result":"DISPATCH GATE: open_agent_prs=3 cap=5 per_repo=2 run_max=4 budget=2 blocked=0 at_limit=- eligible=amarcu/StarBonk\nDISPATCH PLAN: run=smoke-1757246400 1 issue(s) amarcu/StarBonk#77\nThe worker came back without doing anything: it reported: I don't have an issue number to work on.\nDISPATCH END: run=smoke-1757246400 dispatched=0 halted=1 refused=0",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":7,"outputTokens":640,
+  "cacheReadInputTokens":39114,"cacheCreationInputTokens":8801}}}

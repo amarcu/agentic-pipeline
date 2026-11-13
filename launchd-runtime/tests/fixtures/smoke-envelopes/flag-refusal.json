@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":2,
+ "total_cost_usd":0.0113,"session_id":"smoke-fixture-flag-refusal",
+ "permission_denials":[],
+ "result":"I tried to run /morning-triage but the Skill tool refuses to run it: the skill declares disable-model-invocation: true, which blocks model invocation. Nothing was triaged.",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":4,"outputTokens":96,
+  "cacheReadInputTokens":11002,"cacheCreationInputTokens":2210}}}

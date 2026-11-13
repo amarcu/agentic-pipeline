@@ -1,0 +1,28 @@
+#!/bin/bash
+# ledger-lines — the digest's ledger lines, from one command.
+#
+# Usage: ledger-lines <YYYY-MM-DD>
+#
+# Runs spend-today, friction and review-line for the given date, in that
+# order, and prints whatever each prints: one `SPEND:`, `FRICTION:` or
+# `REVIEW:` line, or nothing.
+#
+# It exists because Step 4 used to list the three as three commands. The trace
+# of the 2026-11-12 digest shows the model ran the first and neither of the
+# others, so the friction and review lines were missing with nothing to say
+# why. A step that is one command cannot be done by thirds.
+#
+# One script failing or printing nothing does not stop the next, and the exit
+# is 0 on every path but a bad date (2): the digest still goes out.
+set -u
+
+if [[ ! "${1:-}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+    echo "usage: ledger-lines <YYYY-MM-DD>" >&2
+    exit 2
+fi
+
+HERE="$(/usr/bin/dirname "$0")"
+for script in spend-today friction review-line; do
+    "$HERE/$script" "$1" 2>/dev/null || true
+done
+exit 0

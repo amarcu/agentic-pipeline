@@ -1,0 +1,12 @@
+#!/bin/bash
+# Mock claude-cli that simulates a clean successful run.
+# Accepts the same flags as real claude-cli (we ignore them).
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.128 (Claude Code) [MOCK: success]"
+    exit 0
+fi
+
+echo "Mock claude-cli: clean success"
+echo "Telegram digest sent (message_id 999)."
+exit 0

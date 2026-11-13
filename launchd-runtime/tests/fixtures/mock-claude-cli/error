@@ -1,0 +1,12 @@
+#!/bin/bash
+# Mock claude-cli that simulates a real API failure mode we hit on 2026-05-11.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.128 (Claude Code) [MOCK: error]"
+    exit 0
+fi
+
+echo "Mock claude-cli: working..."
+sleep 1
+echo "API Error: Stream idle timeout - partial response received"
+exit 1

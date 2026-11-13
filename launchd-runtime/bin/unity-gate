@@ -1,0 +1,118 @@
+#!/bin/bash
+# Compile-and-test gate for Unity projects. Prints one JSON verdict on stdout.
+#
+# Verdicts: pass | pass-no-tests | tests-failed | compile-error | infra-error | error
+#
+# Three behaviours shape this script and are not obvious:
+#
+#   1. It runs the editor (-batchmode -runTests), not the Unity CLI. The CLI
+#      checks its sign-in first, which reads a keychain item Unity Hub owns.
+#      From a launchd job the login keychain is unlocked, so macOS shows an
+#      access dialog and the CLI waits for a click that never comes —
+#      StarBonk #46, #56 and #62, and "Always Allow" does not stick on Hub's
+#      item (2026-10-14). The editor needs no sign-in. Its exit codes,
+#      measured under 6000.3.11f1: 0 every test passed, 2 a test failed,
+#      1 no verdict (a compile error writes no report).
+#
+#   2. Importing a project writes .meta files into the tree it runs on, and
+#      rewrites dynamic TMP font atlases. Running against a live checkout
+#      leaves it dirty, so the gate always works in a throwaway worktree.
+#
+#   3. The editor is found from the worktree's ProjectVersion.txt and Unity
+#      Hub's install path, never a hardcoded path: the pipeline host installs
+#      editors to ~/Unity/Editors. UNITY_EDITOR overrides it.
+#
+# A project with zero tests exits 0 and reports result="Passed", so an empty
+# suite is indistinguishable from a green one by exit code. That is why
+# pass and pass-no-tests are separate verdicts and the caller must not merge
+# them: "nothing was verified" is not "everything passed".
+set -uo pipefail
+
+REPO="${1-}"
+REF="${2:-HEAD}"
+TIMEOUT="${GATE_TIMEOUT:-2400}"
+
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+fail() { printf '{"verdict":"error","reason":"%s"}\n' "$(json_escape "$1")"; exit 2; }
+
+[ -n "$REPO" ] || fail "usage: unity-gate <repo-path> [ref]"
+git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || fail "not a git repository: $REPO"
+
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/unity-gate.XXXXXX") || fail "mktemp failed"
+TREE="$WORK/tree"
+RESULTS="$WORK/results.xml"
+LOG="$WORK/editor.log"
+
+cleanup() {
+    git -C "$REPO" worktree remove --force "$TREE" >/dev/null 2>&1
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+
+# Keep git's own message: "invalid reference" and "already checked out" need
+# different fixes, and the caller only sees this JSON.
+wt_err=$(git -C "$REPO" worktree add --detach "$TREE" "$REF" 2>&1 >/dev/null \
+    | tr '\n' ' ' | sed 's/[[:space:]]*$//') \
+    || fail "could not create worktree for $REF: ${wt_err:-git gave no reason}"
+
+EDITOR="${UNITY_EDITOR:-}"
+if [ -z "$EDITOR" ]; then
+    VERSION=$(sed -n 's/^m_EditorVersion: *//p' "$TREE/ProjectSettings/ProjectVersion.txt" 2>/dev/null | tr -d '[:space:]')
+    [ -n "$VERSION" ] || fail "no m_EditorVersion in ProjectSettings/ProjectVersion.txt at $REF"
+    HUB_PATH=$(tr -d '"\n' < "$HOME/Library/Application Support/UnityHub/secondaryInstallPath.json" 2>/dev/null)
+    for dir in ${HUB_PATH:+"$HUB_PATH"} "/Applications/Unity/Hub/Editor"; do
+        if [ -x "$dir/$VERSION/Unity.app/Contents/MacOS/Unity" ]; then
+            EDITOR="$dir/$VERSION/Unity.app/Contents/MacOS/Unity"
+            break
+        fi
+    done
+    [ -n "$EDITOR" ] || fail "Unity $VERSION is not installed (looked in Hub's install path and /Applications/Unity/Hub/Editor)"
+fi
+[ -x "$EDITOR" ] || fail "unity editor not found at $EDITOR"
+
+"$EDITOR" -batchmode -nographics -projectPath "$TREE" -runTests -testPlatform EditMode \
+    -testResults "$RESULTS" -logFile "$LOG" >/dev/null 2>"$WORK/editor.err" &
+PID=$!
+WAITED=0
+while kill -0 "$PID" 2>/dev/null && [ "$WAITED" -lt "$TIMEOUT" ]; do
+    sleep 1; WAITED=$((WAITED + 1))
+done
+if kill -0 "$PID" 2>/dev/null; then
+    kill "$PID" 2>/dev/null; sleep 2; kill -9 "$PID" 2>/dev/null
+    wait "$PID" 2>/dev/null
+    printf '{"verdict":"infra-error","reason":"the editor did not finish within %ss"}\n' "$TIMEOUT"
+    exit 0
+fi
+wait "$PID"
+CODE=$?
+
+# Counts come from the NUnit report. A run that never reached the test
+# runner writes no report, which is what separates a failed test from a
+# run with no verdict.
+xml_attr() { sed -n "s/.*<test-run [^>]*[^a-z]$1=\"\([0-9]*\)\".*/\1/p" "$RESULTS" 2>/dev/null | head -1; }
+TOTAL=$(xml_attr testcasecount)
+FAILED=$(xml_attr failed)
+
+case "$CODE" in
+    0)
+        if [ "${TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+            printf '{"verdict":"pass","tests":%s,"failed":0}\n' "$TOTAL"
+        else
+            printf '{"verdict":"pass-no-tests","tests":0,"note":"project compiles; no EditMode tests exist"}\n'
+        fi
+        ;;
+    2)
+        names=$(sed -n 's/.*<test-case [^>]*fullname="\([^"]*\)"[^>]*result="Failed".*/\1/p' "$RESULTS" 2>/dev/null | head -20 | paste -sd';' -)
+        printf '{"verdict":"tests-failed","tests":%s,"failed":%s,"failing":"%s"}\n' \
+            "${TOTAL:-0}" "${FAILED:-0}" "$(json_escape "$names")"
+        ;;
+    *)
+        errs=$(grep -o "error CS[0-9]*: .*" "$LOG" 2>/dev/null | sort -u | head -20 | paste -sd'|' -)
+        if [ -n "$errs" ]; then
+            printf '{"verdict":"compile-error","errors":"%s"}\n' "$(json_escape "$errs")"
+        else
+            reason=$(grep -m 1 -i -E "licen[cs]|error|abort" "$LOG" 2>/dev/null | cut -c1-200)
+            printf '{"verdict":"infra-error","reason":"%s"}\n' "$(json_escape "${reason:-unity exited $CODE with no test report and no compile errors}")"
+        fi
+        ;;
+esac

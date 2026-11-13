@@ -1,0 +1,273 @@
+#!/usr/bin/python3
+"""Review-round rollup: how many rounds each agent pull request took, and what they found.
+
+pipeline-metrics says whether an agent PR merged. It does not say what the PR
+cost to get there: a PR that passed review first time and one that used all
+three rounds and then merged anyway are the same row in the funnel. This is the
+missing column. It answers, per repo and overall:
+
+  rounds        the most rounds any one lane took on a PR. The two lanes count
+                their rounds separately and REVIEW_ROUND_MAX bounds each, so
+                the lanes are never summed
+  clean         PRs on which every marked review was a pass. A pass from one
+                lane that the other lane then overturned is not clean
+  at cap        PRs on which one lane used REVIEW_ROUND_MAX rounds
+  findings      distinct findings raised, by severity
+  head unpassed merged PRs with marked reviews, none of which is a pass on the
+                commit that merged: the last verdict was not a pass, or commits
+                landed after it
+  unmarked      agent PRs with no marked review. Not "unreviewed": a PR older
+                than the markers, or one read another way, lands here too
+
+Nothing is read from a local ledger. Both review lanes post a marker as the
+first line of every review they leave on the pull request:
+
+  <!-- review-pr     repo=… pr=… round=K head=… [model=…] verdict=… gate=… -->
+  <!-- cursor-review repo=… pr=… round=K head=… model=… verdict=… request_id=… -->
+
+and end every finding with `<!-- finding:<id> severity:<s> round:<K> -->`. The
+pull request is therefore the record, and this runs the same from any host.
+
+A finding is counted once per lane and id. Only a comment that belongs to a
+marked review, or an issue comment that itself starts with a lane marker (the
+findings cursor-review could not anchor to a line), can carry one: a reply or a
+human comment that quotes a tag is not a second finding.
+
+Usage: review-rollup [--repo owner/repo ... | --active] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
+                     [--all] [--json] [--keep-going]
+
+  --repo    roll up these repos instead of REPOS_BY_PRIORITY in repos.conf
+  --active  roll up ACTIVE_REPOS, the repos the pipeline works on tonight,
+            instead of the whole roster
+  --since   only pull requests opened on or after this date
+  --until   only pull requests opened on or before this date; with --since the
+            window is closed at both ends, as routine-cost's is
+  --all     every pull request, not only agent branches (task/issue-<N>-*,
+            worktree-issue-<N>*, the same predicate as bin/agent-prs)
+  --json    machine-readable output, with one row per pull request
+  --keep-going  a repo that cannot be read becomes a row with an `error` and
+            stays out of the totals, instead of failing the whole rollup. For
+            a caller that reports the rest, such as the evening digest
+
+Requires: gh (authenticated). Read-only; makes no writes to GitHub.
+Exit codes: 0 rolled up (with --keep-going: even when repos failed; their rows
+say so), 1 a query failed, 2 usage.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(HERE, "..", "repos.conf")
+AGENT_BRANCH_RE = re.compile(r"^(task/issue-\d+-|worktree-issue-\d+)")
+MARKER_RE = re.compile(
+    r"^<!-- (review-pr|cursor-review) repo=\S+ pr=\d+ round=(\d+) head=([0-9a-f]{7,40})"
+    r"(?: model=(\S+))? verdict=([a-z-]+)")
+FINDING_RE = re.compile(r"<!-- finding:(\S+) severity:(blocker|major|minor) round:(\d+) -->")
+SEVERITIES = ("blocker", "major", "minor")
+
+
+def gh_bin():
+    found = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+    if not os.access(found, os.X_OK):
+        sys.stderr.write("review-rollup: gh not found on PATH or at ~/.local/bin/gh\n")
+        sys.exit(1)
+    return found
+
+
+def gh_api(gh, path):
+    """One paginated read; --slurp separates the pages structurally."""
+    out = subprocess.run([gh, "api", path, "--paginate", "--slurp"],
+                         capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip()[:200] or "gh api %s failed" % path)
+    pages = json.loads(out.stdout or "[]")
+    return [item for page in pages for item in page]
+
+
+def read_conf():
+    """Both repo rosters and the round cap, from repos.conf."""
+    rosters, cap, current = {"REPOS_BY_PRIORITY": [], "ACTIVE_REPOS": []}, None, None
+    try:
+        with open(REPOS_CONF) as f:
+            for line in f:
+                m = re.match(r"REVIEW_ROUND_MAX=(\d+)", line)
+                if m:
+                    cap = int(m.group(1))
+                opened = re.match(r"(REPOS_BY_PRIORITY|ACTIVE_REPOS)=\(", line)
+                if opened:
+                    current = rosters[opened.group(1)]
+                    line = line[opened.end():]
+                if current is not None:
+                    for name in re.findall(r'"([\w.-]+/[\w.-]+)"', line.split("#", 1)[0]):
+                        if name not in current:
+                            current.append(name)
+                    if ")" in line.split("#", 1)[0]:
+                        current = None
+    except OSError:
+        pass
+    return rosters, cap
+
+
+def rollup_pr(gh, repo, pr, cap):
+    n = pr["number"]
+    reviews = []          # (submitted_at, lane, round, head, model, verdict)
+    lane_of_review = {}   # review id -> lane
+    for rv in gh_api(gh, "repos/%s/pulls/%d/reviews?per_page=100" % (repo, n)):
+        m = MARKER_RE.match(rv.get("body") or "")
+        if not m:
+            continue
+        lane_of_review[rv.get("id")] = m.group(1)
+        reviews.append((rv.get("submitted_at") or "", m.group(1), int(m.group(2)),
+                        m.group(3), m.group(4), m.group(5)))
+    reviews.sort()
+
+    findings = {}         # (lane, id) -> severity, first sighting wins
+    if reviews:
+        for c in gh_api(gh, "repos/%s/pulls/%d/comments?per_page=100" % (repo, n)):
+            lane = lane_of_review.get(c.get("pull_request_review_id"))
+            if lane is None or c.get("in_reply_to_id"):
+                continue
+            for fid, sev, _ in FINDING_RE.findall(c.get("body") or ""):
+                findings.setdefault((lane, fid), sev)
+        for c in gh_api(gh, "repos/%s/issues/%d/comments?per_page=100" % (repo, n)):
+            body = c.get("body") or ""
+            m = MARKER_RE.match(body)
+            if not m:
+                continue
+            for fid, sev, _ in FINDING_RE.findall(body):
+                findings.setdefault((m.group(1), fid), sev)
+
+    rounds_by_lane = {}
+    for _, lane, rnd, _, _, _ in reviews:
+        rounds_by_lane.setdefault(lane, set()).add(rnd)
+    rounds_by_lane = {lane: len(r) for lane, r in sorted(rounds_by_lane.items())}
+    counts = {s: 0 for s in SEVERITIES}
+    for sev in findings.values():
+        counts[sev] += 1
+    counts["total"] = len(findings)
+    merged = bool(pr.get("merged_at"))
+    head_sha = pr.get("head", {}).get("sha") or ""
+    head_passed = any(r[5] == "pass" and head_sha.startswith(r[3]) for r in reviews)
+    return {
+        "number": n,
+        "branch": pr.get("head", {}).get("ref", ""),
+        "state": "merged" if merged else pr.get("state", "open"),
+        "opened": (pr.get("created_at") or "")[:10],
+        "merged_at": pr.get("merged_at"),
+        "rounds": max(rounds_by_lane.values()) if rounds_by_lane else 0,
+        "rounds_by_lane": rounds_by_lane,
+        "models": sorted({r[4] for r in reviews if r[4]}),
+        "final_verdict": reviews[-1][5] if reviews else None,
+        "clean": bool(reviews) and all(r[5] == "pass" for r in reviews),
+        "at_round_cap": bool(cap) and any(n >= cap for n in rounds_by_lane.values()),
+        "merged_head_unpassed": merged and bool(reviews) and not head_passed,
+        "findings": counts,
+    }
+
+
+def summarize(prs):
+    reviewed = [p for p in prs if p["rounds"]]
+    findings = {k: sum(p["findings"][k] for p in prs) for k in SEVERITIES + ("total",)}
+    median = statistics.median([p["rounds"] for p in reviewed]) if reviewed else None
+    return {
+        "agent_prs": len(prs),
+        "reviewed": len(reviewed),
+        "unmarked": len(prs) - len(reviewed),
+        "clean": sum(1 for p in prs if p["clean"]),
+        "median_rounds": round(median, 1) if median is not None else None,
+        "at_round_cap": sum(1 for p in prs if p["at_round_cap"]),
+        "merged_head_unpassed": sum(1 for p in prs if p["merged_head_unpassed"]),
+        "findings": findings,
+    }
+
+
+def print_table(rows, total, cap):
+    head = "%-28s %4s %4s %6s %6s %6s %12s %8s %8s" % (
+        "repo", "PRs", "rev", "clean", "med.rd", "at cap", "find b/M/m", "head unp", "unmarked")
+    print(head)
+
+    def line(name, s):
+        f = s["findings"]
+        print("%-28s %4d %4d %6d %6s %6d %12s %8d %8d" % (
+            name[:28], s["agent_prs"], s["reviewed"], s["clean"],
+            "-" if s["median_rounds"] is None else s["median_rounds"],
+            s["at_round_cap"], "%d/%d/%d" % (f["blocker"], f["major"], f["minor"]),
+            s["merged_head_unpassed"], s["unmarked"]))
+
+    for r in rows:
+        if "error" in r:
+            print("%-28s (error) %s" % (r["repo"][:28], r["error"][:60]))
+        else:
+            line(r["repo"], r["summary"])
+    line("TOTAL", total)
+    print()
+    print("rev = PRs with a marked review; clean = every marked review was a pass;")
+    print("med.rd = median of the most rounds one lane took; at cap = a lane used %s rounds;"
+          % (cap if cap else "REVIEW_ROUND_MAX (not set)"))
+    print("find = distinct findings blocker/major/minor; head unp = merged, reviewed, and no")
+    print("pass on the merged commit; unmarked = no marked review (not the same as unreviewed).")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("--repo", action="append", default=[])
+    ap.add_argument("--active", action="store_true")
+    ap.add_argument("--since")
+    ap.add_argument("--until")
+    ap.add_argument("--all", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--keep-going", action="store_true")
+    args = ap.parse_args()
+    for flag, value in (("--since", args.since), ("--until", args.until)):
+        if value and not re.match(r"^\d{4}-\d{2}-\d{2}$", value):
+            sys.stderr.write("review-rollup: %s takes YYYY-MM-DD, got: %s\n" % (flag, value))
+            return 2
+
+    rosters, cap = read_conf()
+    repos = args.repo or rosters["ACTIVE_REPOS" if args.active else "REPOS_BY_PRIORITY"]
+    if not repos:
+        sys.stderr.write("review-rollup: no repos: pass --repo, or check %s\n" % REPOS_CONF)
+        return 2
+
+    gh = gh_bin()
+    rows, every = [], []
+    for repo in repos:
+        try:
+            pulls = gh_api(gh, "repos/%s/pulls?state=all&per_page=100" % repo)
+            prs = []
+            for pr in pulls:
+                if not args.all and not AGENT_BRANCH_RE.match(pr.get("head", {}).get("ref", "")):
+                    continue
+                opened = (pr.get("created_at") or "")[:10]
+                if (args.since and opened < args.since) or (args.until and opened > args.until):
+                    continue
+                prs.append(rollup_pr(gh, repo, pr, cap))
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+            sys.stderr.write("review-rollup: %s: %s\n" % (repo, e))
+            if not args.keep_going:
+                return 1
+            rows.append({"repo": repo, "error": str(e)[:200]})
+            continue
+        prs.sort(key=lambda p: p["number"])
+        rows.append({"repo": repo, "summary": summarize(prs), "prs": prs})
+        every.extend(prs)
+
+    total = summarize(every)
+    if args.json:
+        json.dump({"round_cap": cap, "since": args.since, "until": args.until,
+                   "repos": rows, "total": total},
+                  sys.stdout, indent=2)
+        print()
+    else:
+        print_table(rows, total, cap)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

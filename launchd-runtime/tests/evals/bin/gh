@@ -1,0 +1,160 @@
+#!/bin/bash
+# A stand-in for `gh` that an eval case puts first on PATH. It never reaches
+# GitHub, and a real `gh` reached around it cannot authenticate: the runner
+# points GH_CONFIG_DIR at an empty directory and clears GH_TOKEN.
+#
+# Grown from evals/_fixtures/bin/gh on the plugin-eval branch, with two
+# additions the review lane needs.
+#
+# Every call is appended to $EVAL_GH_LOG as one line for a human to read, and
+# its full argument vector is written NUL-separated to $EVAL_GH_LOG.d/NNN.argv.
+# NUL because a finding's body is many lines and carries quotes: a line-per-
+# argument file cannot say where one argument ends, and a grader reading it
+# loses the severity tag on the last line of the body. That directory is what
+# the graders read to judge what the skill actually posted.
+#
+# `--jq` is applied, not ignored: `review-pr` verifies its own post with
+# `gh api …/reviews --jq '.[-1].body'`, and a mock that answers that with the
+# whole JSON array fails the skill on the harness's behalf. $EVAL_JQ, or jq on
+# PATH, does the filtering; if neither resolves, the call fails loudly rather
+# than returning a body that was never filtered.
+#
+# Each line of $EVAL_GH_ROUTES is `<extended regex>\t<exit code>\t<response
+# file, or ->`, and the first pattern matching the space-joined arguments
+# answers the call: the response file, relative to the routes file, is printed
+# and the exit code returned. A call no route matches is logged as
+# `UNHANDLED gh <args>` and exits 97, so a gap in the fixture reads as a harness
+# gap and never as the skill's own failure.
+#
+# POSTing a review is answered AND remembered: the review body is appended to
+# $EVAL_REVIEWS_FILE as a `{"body": …}` element, so the skill's own Step 6
+# verification — `gh api …/reviews --jq '.[-1].body'` — reads back what this run
+# posted, exactly as GitHub would serve it. Without that the skill either fails
+# its verify or is taught to trust a POST it cannot see.
+
+# `-F key=@path` is resolved to the file's content before anything is recorded,
+# as real gh reads it. Skills write a review body to a temp file under the
+# bundle, which the next run overwrites, so recording the path would leave the
+# grader nothing to read.
+#
+# The inline comments of a POSTed review are remembered too, in
+# $EVAL_COMMENTS_FILE, so a skill that reads its own threads back
+# (`gh api …/pulls/<n>/comments`) sees what it posted.
+
+set -u
+
+log="${EVAL_GH_LOG:?eval gh: EVAL_GH_LOG is not set}"
+routes="${EVAL_GH_ROUTES:?eval gh: EVAL_GH_ROUTES is not set}"
+
+resolved=()
+prev=""
+for a in "$@"; do
+    if [[ ( "$prev" == "-F" || "$prev" == "--field" ) && "$a" =~ ^([^=]+)=@(.+)$ && -f "${BASH_REMATCH[2]}" ]]; then
+        a="${BASH_REMATCH[1]}=$(/bin/cat "${BASH_REMATCH[2]}")"
+    elif [[ "$prev" == "--input" && -f "$a" ]]; then
+        # A request body in a file (skills/review-pr/scripts/post-review posts this
+        # way, and deletes the file after). Recorded as its JSON content.
+        a="@json:$(/bin/cat "$a")"
+    fi
+    resolved+=("$a")
+    prev="$a"
+done
+set -- "${resolved[@]}"
+args="$*"
+
+record_argv() {
+    local dir="$log.d" n=1
+    /bin/mkdir -p "$dir"
+    while [[ -e "$dir/$(/usr/bin/printf '%03d' "$n").argv" ]]; do n=$((n + 1)); done
+    /usr/bin/printf '%s\0' "$@" > "$dir/$(/usr/bin/printf '%03d' "$n").argv"
+}
+
+# A review POST carries its body in `-f body=…` and each finding in
+# `-F comments[][…]=…`. Remembering it is what makes the reviews GET honest.
+remember_review() {
+    [[ -n "${EVAL_REVIEWS_FILE:-}" ]] || return 0
+    /usr/bin/python3 - "$EVAL_REVIEWS_FILE" "$@" <<'PY'
+import json, os, sys
+path, argv = sys.argv[1], sys.argv[2:]
+body = ""
+payload = next((json.loads(a[len("@json:"):]) for a in argv if a.startswith("@json:")), None)
+if isinstance(payload, dict):
+    body = payload.get("body", "")
+    argv = argv + ["comments[][%s]=%s" % (k, c.get(k, "")) for c in payload.get("comments", []) for k in ("path", "line", "body")]
+for i, arg in enumerate(argv):
+    if arg.startswith("body=") and i and argv[i - 1] in ("-f", "-F", "--raw-field", "--field"):
+        body = arg[len("body="):]
+    elif arg.startswith("--raw-field=body=") or arg.startswith("--field=body="):
+        body = arg.split("body=", 1)[1]
+reviews = []
+if os.path.exists(path):
+    try:
+        reviews = json.load(open(path))
+    except ValueError:
+        reviews = []
+reviews.append({"id": 900000 + len(reviews), "state": "COMMENTED", "body": body})
+json.dump(reviews, open(path, "w"), indent=1)
+
+comments_path = os.environ.get("EVAL_COMMENTS_FILE")
+if comments_path:
+    comments, current = [], {}
+    if os.path.exists(comments_path):
+        try:
+            comments = json.load(open(comments_path))
+        except ValueError:
+            comments = []
+    for arg in argv:
+        for key in ("path", "line", "body"):
+            prefix = "comments[][%s]=" % key
+            if arg.startswith(prefix):
+                if key == "path" and current:
+                    comments.append(current)
+                    current = {}
+                value = arg[len(prefix):]
+                current[key] = int(value) if key == "line" and value.isdigit() else value
+    if current:
+        comments.append(current)
+    for i, c in enumerate(comments):
+        c.setdefault("id", 800000 + i)
+        c.setdefault("original_line", c.get("line"))
+    json.dump(comments, open(comments_path, "w"), indent=1)
+PY
+}
+
+while IFS=$'\t' read -r pattern code response; do
+    [[ -z "$pattern" || "$pattern" == \#* ]] && continue
+    if [[ "$args" =~ $pattern ]]; then
+        printf 'gh %s\n' "$args" >> "$log"
+        record_argv "$@"
+        if [[ "$args" =~ reviews.*(-X|--method)\ POST || "$args" =~ (-X|--method)\ POST.*reviews ]]; then
+            remember_review "$@"
+        fi
+        if [[ "$response" != "-" ]]; then
+            file="$(/usr/bin/dirname "$routes")/$response"
+            jq_expr=""
+            prev=""
+            for a in "$@"; do
+                [[ "$prev" == "--jq" ]] && jq_expr="$a"
+                prev="$a"
+            done
+            if [[ -n "$jq_expr" ]]; then
+                jq_bin="${EVAL_JQ:-$(command -v jq || true)}"
+                if [[ -z "$jq_bin" || ! -x "$jq_bin" ]]; then
+                    echo "eval gh: --jq given but no jq resolved (set EVAL_JQ)" >&2
+                    exit 90
+                fi
+                "$jq_bin" -r "$jq_expr" < "$file"
+                jq_status=$?
+                [[ "$jq_status" -ne 0 ]] && exit "$jq_status"
+                exit "$code"
+            fi
+            /bin/cat "$file"
+        fi
+        exit "$code"
+    fi
+done < "$routes"
+
+printf 'UNHANDLED gh %s\n' "$args" >> "$log"
+record_argv "$@"
+echo "eval gh: no route for: gh $args" >&2
+exit 97

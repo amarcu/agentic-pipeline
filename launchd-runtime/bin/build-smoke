@@ -1,0 +1,49 @@
+#!/bin/bash
+# build-smoke <repo-path> <ref> — does the game still start? A Mac build of <ref>, made by the
+# repo's own Tools/build.sh in a throwaway worktree, run headless for BUILD_SMOKE_SECONDS.
+#
+# The merge lane needs it for a change to scenes or prefabs: EditMode tests cannot see a scene, and
+# a scene that loads a missing script or a broken reference fails when the player starts, not when
+# the tests compile.
+#
+# Prints one line: SMOKE: result=<pass|fail|error> reason=<why> seconds=<n>
+# Exit 0 pass, 1 fail, 2 usage or setup error.
+set -u
+REPO_PATH="${1:-}"
+REF="${2:-}"
+SECONDS_UP="${BUILD_SMOKE_SECONDS:-30}"
+[ -n "$REPO_PATH" ] && [ -n "$REF" ] || { echo "SMOKE: result=error reason=usage: build-smoke <repo-path> <ref> seconds=0"; exit 2; }
+START=$(/bin/date +%s)
+say() { echo "SMOKE: result=$1 reason=$2 seconds=$(( $(/bin/date +%s) - START ))"; }
+
+WORK=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/build-smoke.XXXXXX") || { say error "mktemp failed"; exit 2; }
+TREE="$WORK/tree"
+cleanup() {
+    /usr/bin/git -C "$REPO_PATH" worktree remove --force "$TREE" >/dev/null 2>&1
+    /bin/rm -rf "$WORK"
+}
+trap cleanup EXIT
+/usr/bin/git -C "$REPO_PATH" worktree add -q --detach "$TREE" "$REF" 2>/dev/null || { say error "git worktree add $REF failed"; exit 2; }
+[ -x "$TREE/Tools/build.sh" ] || { say error "Tools/build.sh does not exist at $REF"; exit 2; }
+
+build_line=$(cd "$TREE" && ./Tools/build.sh mac "$WORK/out" 2>&1 | /usr/bin/grep '^BUILD:' | /usr/bin/tail -1)
+case "$build_line" in *" exit=0 "*) : ;; *) say fail "the mac build failed (${build_line:-no BUILD line})"; exit 1 ;; esac
+app=$(/bin/ls -d "$WORK/out"/*.app 2>/dev/null | /usr/bin/head -1)
+exe=$(/bin/ls "$app/Contents/MacOS/" 2>/dev/null | /usr/bin/head -1)
+[ -n "$app" ] && [ -n "$exe" ] || { say fail "the mac build has no app"; exit 1; }
+
+"$app/Contents/MacOS/$exe" -batchmode -nographics -logFile "$WORK/player.log" >/dev/null 2>&1 &
+pid=$!
+/bin/sleep "$SECONDS_UP"
+if ! kill -0 "$pid" 2>/dev/null; then
+    say fail "the player exited within ${SECONDS_UP}s of starting"
+    exit 1
+fi
+kill "$pid" 2>/dev/null; /bin/sleep 1; kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+# No log means the player never got far enough to write one, so nothing below was checked.
+[ -s "$WORK/player.log" ] || { say fail "the player wrote no log, so its scenes were not checked"; exit 1; }
+# A missing script on a scene object is the classic broken wiring; Unity logs it and carries on.
+missing=$(/usr/bin/grep -c "The referenced script .* is missing" "$WORK/player.log" 2>/dev/null)
+[ "${missing:-0}" -eq 0 ] || { say fail "the player log reports $missing missing script(s)"; exit 1; }
+say pass "the player ran ${SECONDS_UP}s with no missing script"
+exit 0

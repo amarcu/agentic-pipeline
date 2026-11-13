@@ -1,0 +1,27 @@
+name: test
+
+# The gate, on a hosted macOS runner. The suite is hermetic: gh, the Claude
+# CLI, Cursor, Unity and Telegram are all mocks, and no test reaches the
+# network. The runtime targets macOS (/bin/bash 3.2, /usr/bin/python3,
+# launchd), so the runner is macOS too.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tool versions
+        run: |
+          /bin/bash --version | head -1
+          /usr/bin/python3 --version
+          command -v jq && jq --version
+      - name: make test
+        run: make test

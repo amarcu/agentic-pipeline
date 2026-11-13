@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.agentic-skills.routines.pr-review-night</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__AGENTIC_HOME__/routines/_run.sh</string>
+        <string>pr-review-night</string>
+    </array>
+    <!-- 05:00, not 04:35. dispatch-tasks-night starts at 04:10 with a 2700s
+         timeout, so 04:55 is the first moment it is nominally finished. Both
+         routines write to the same repos and worktrees and _run.sh has no lock,
+         so the prompt still checks for a live dispatch: over 94 nights the
+         longest ran 8.9 hours, far past its own cap. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>5</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-pr-review-night.stdout</string>
+    <key>StandardErrorPath</key>
+    <string>__AGENTIC_HOME__/routines/logs/launchd-pr-review-night.stderr</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Grok reviews the merge-lane repos in the precheck (bin/pr-review-grok-night), so
+             pr-iterate-night at 06:00 answers its findings the same night. No model starts unless
+             an active repo is outside the merge lane. No review starts after 35 minutes and each
+             gate is capped at 10, so the worst case ends at 05:50, before iterate at 06:00. -->
+        <key>ROUTINE_PRECHECK</key>
+        <string>pr-review-grok-night</string>
+        <key>ROUTINE_PRECHECK_TIMEOUT</key>
+        <string>3300</string>
+        <key>ROUTINE_CAPTURE_JSON</key>
+        <string>1</string>
+        <key>PATH</key>
+        <string>__HOME__/.unity/bin:__HOME__/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin</string>
+        <key>HOME</key>
+        <string>__HOME__</string>
+        <key>ROUTINE_TIMEOUT_SECONDS</key>
+        <string>3600</string>
+        <!-- Four reviews at opus/high. Sized from dispatch's measured $2.51 per
+             task; a runaway guard, not a target. -->
+        <key>ROUTINE_MAX_BUDGET_USD</key>
+        <string>12.00</string>
+    </dict>
+</dict>
+</plist>

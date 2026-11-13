@@ -1,0 +1,127 @@
+#!/bin/bash
+# playtest-build <owner/repo> — build the repo's main for the owner to play, and hand it over.
+#
+# The owner asked for a build to test every couple of days (2026-10-17). This script is that
+# hand-over, with no model in it:
+#   1. Skip when origin/main is the commit the last build was made from.
+#   2. In a throwaway worktree at that commit, run the repo's own Tools/build.sh for each target.
+#      The repo owns how it builds; this script never learns Unity's flags.
+#   3. Smoke-test the Mac build: run it headless for PLAYTEST_SMOKE_SECONDS and fail if it exits.
+#   4. Zip each target and publish them as a pre-release on the repo's GitHub releases, with the
+#      commits since the last build as its notes. The repo is private, so only the owner sees it.
+#   5. Send the release link to the owner on Telegram.
+# A failed build or smoke test is a normal outcome: the owner is told, nothing is published, and
+# the next run tries the same commit again.
+#
+# Prints one line: PLAYTEST-BUILD: repo=<r> sha=<7> result=<released|skipped|failed|error> ...
+# Exit 0 on released, skipped and failed; exit 1 only when this script itself could not work.
+#
+# Environment (tests set these): REPOS_CONF, GH_BIN, TELEGRAM_SEND_BIN, PLAYTEST_BUILD_STATE_DIR,
+# PLAYTEST_BUILD_TARGETS (default "mac windows"), PLAYTEST_SMOKE_SECONDS (default 30).
+set -u
+HERE=$(cd "$(/usr/bin/dirname "$0")" && pwd)
+REPO="${1:-}"
+CONF="${REPOS_CONF:-$HERE/../repos.conf}"
+GH="${GH_BIN:-$(command -v gh || echo "$HOME/.local/bin/gh")}"
+TELEGRAM="${TELEGRAM_SEND_BIN:-$HERE/telegram-send}"
+STATE_DIR="${PLAYTEST_BUILD_STATE_DIR:-$HOME/.config/agentic-skills/playtest-build}"
+TARGETS="${PLAYTEST_BUILD_TARGETS:-mac windows}"
+SMOKE_SECONDS="${PLAYTEST_SMOKE_SECONDS:-30}"
+TODAY=$(/bin/date +%Y-%m-%d)
+
+line() { echo "PLAYTEST-BUILD: repo=$REPO $*"; }
+error() { line "result=error reason=$1"; exit 1; }
+
+[ -n "$REPO" ] || { echo "usage: playtest-build <owner/repo>"; exit 2; }
+[ -x "$GH" ] || error "gh not found at $GH"
+. "$CONF" || error "cannot read $CONF"
+REPO_PATH=$(get_repo_path "$REPO")
+[ -n "$REPO_PATH" ] && [ -d "$REPO_PATH" ] || error "no local checkout (get_repo_path)"
+/bin/mkdir -p "$STATE_DIR" || error "cannot create $STATE_DIR"
+[ -e "$STATE_DIR/OFF" ] && { line "result=skipped reason=kill-switch"; exit 0; }
+
+/usr/bin/git -C "$REPO_PATH" fetch -q origin main 2>/dev/null || error "git fetch origin main failed"
+SHA=$(/usr/bin/git -C "$REPO_PATH" rev-parse origin/main) || error "no origin/main"
+SHA7="${SHA:0:7}"
+STATE="$STATE_DIR/${REPO//\//-}.last"
+LAST=$(/bin/cat "$STATE" 2>/dev/null)
+[ "$SHA" = "$LAST" ] && { line "sha=$SHA7 result=skipped reason=unchanged"; exit 0; }
+/usr/bin/git -C "$REPO_PATH" cat-file -e "$SHA:Tools/build.sh" 2>/dev/null \
+    || error "Tools/build.sh does not exist at $SHA7"
+
+WORK=$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/playtest-build.XXXXXX") || error "mktemp failed"
+TREE="$WORK/tree"
+cleanup() {
+    /usr/bin/git -C "$REPO_PATH" worktree remove --force "$TREE" >/dev/null 2>&1
+    /bin/rm -rf "$WORK"
+}
+trap cleanup EXIT
+/usr/bin/git -C "$REPO_PATH" worktree add -q --detach "$TREE" "$SHA" 2>/dev/null || error "git worktree add failed"
+
+tell() {
+    printf '%s\n' "$1" > "$WORK/telegram.txt"
+    "$TELEGRAM" "$WORK/telegram.txt" >/dev/null 2>&1 || echo "playtest-build: the Telegram message was not sent"
+}
+failed() {
+    line "sha=$SHA7 result=failed reason=$1"
+    tell "🛠 ${REPO##*/} playtest build failed at $SHA7: $1. Nothing was published; the next run tries again."
+    exit 0
+}
+
+NAME="${REPO##*/}-$TODAY-$SHA7"
+ASSETS=()
+for target in $TARGETS; do
+    out="$WORK/out/$target"
+    build_line=$(cd "$TREE" && ./Tools/build.sh "$target" "$out" 2>&1 | /usr/bin/grep '^BUILD:' | /usr/bin/tail -1)
+    echo "$build_line"
+    case "$build_line" in *" exit=0 "*) : ;; *) failed "the $target build failed" ;; esac
+
+    if [ "$target" = mac ]; then
+        app=$(/bin/ls -d "$out"/*.app 2>/dev/null | /usr/bin/head -1)
+        exe=$(/bin/ls "$app/Contents/MacOS/" 2>/dev/null | /usr/bin/head -1)
+        [ -n "$app" ] && [ -n "$exe" ] || failed "the mac build has no app"
+        "$app/Contents/MacOS/$exe" -batchmode -nographics -logFile "$WORK/smoke.log" >/dev/null 2>&1 &
+        pid=$!
+        /bin/sleep "$SMOKE_SECONDS"
+        kill -0 "$pid" 2>/dev/null || failed "the mac build exited within ${SMOKE_SECONDS}s of starting"
+        kill "$pid" 2>/dev/null; /bin/sleep 1; kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+        SMOKE_ERRORS=$(/usr/bin/grep -c -E "Exception|Error" "$WORK/smoke.log" 2>/dev/null)
+        # The app alone: Unity writes its Burst _DoNotShip folder beside it. No resource forks or
+        # extended attributes: unzip writes them into the bundle as ._ files, which breaks its seal.
+        /usr/bin/ditto -c -k --norsrc --noextattr --keepParent "$app" "$WORK/$NAME-mac.zip" || error "zipping the mac build failed"
+        ASSETS+=("$WORK/$NAME-mac.zip")
+    else
+        # Unity marks its Burst debug folder _DoNotShip.
+        (cd "$out" && /usr/bin/zip -qry "$WORK/$NAME-$target.zip" . -x '*_DoNotShip*') \
+            || error "zipping the $target build failed"
+        ASSETS+=("$WORK/$NAME-$target.zip")
+    fi
+done
+
+if [ -n "$LAST" ] && /usr/bin/git -C "$REPO_PATH" merge-base --is-ancestor "$LAST" "$SHA" 2>/dev/null; then
+    changes=$(/usr/bin/git -C "$REPO_PATH" log --first-parent --format='- %s' "$LAST..$SHA")
+    since="since the last playtest build (${LAST:0:7})"
+else
+    changes=$(/usr/bin/git -C "$REPO_PATH" log --first-parent --format='- %s' -10 "$SHA")
+    since="(the last 10; no earlier playtest build to compare with)"
+fi
+COUNT=$(printf '%s\n' "$changes" | /usr/bin/grep -c '^- ')
+{
+    echo "Playtest build of \`main\` at $SHA7, made $TODAY."
+    echo
+    echo "Smoke test: the Mac build ran ${SMOKE_SECONDS:-0} s headless; its log has ${SMOKE_ERRORS:-n/a} error line(s)."
+    echo "Mac: unzip and open the app. If macOS blocks it, right-click it and choose Open."
+    echo
+    echo "## Changes $since"
+    echo "$changes"
+} > "$WORK/notes.md"
+
+TAG="playtest-$TODAY-$SHA7"
+url=$("$GH" release create "$TAG" --repo "$REPO" --target "$SHA" --prerelease \
+    --title "Playtest build $TODAY ($SHA7)" --notes-file "$WORK/notes.md" "${ASSETS[@]}" 2>"$WORK/gh.err") \
+    || error "gh release create failed: $(/usr/bin/head -c 200 "$WORK/gh.err" | /usr/bin/tr '\n' ' ')"
+url=$(printf '%s\n' "$url" | /usr/bin/grep -m 1 '^https://')
+
+echo "$SHA" > "$STATE"
+tell "🎮 New ${REPO##*/} playtest build ($SHA7, $COUNT change(s)): $url"
+line "sha=$SHA7 result=released targets=${TARGETS// /,} changes=$COUNT url=$url"

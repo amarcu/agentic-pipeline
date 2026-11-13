@@ -1,0 +1,65 @@
+# machines.conf — the machines the pipeline may use, and how to reach each.
+#
+# THIS FILE IS THE EXAMPLE. Copy it to `machines.conf` beside it and put your
+# own hosts in the copy, which is git-ignored. Only bin/machine and the
+# use-machine skill read it; a setup with one machine does not need it.
+#
+# Sourced, never executed. Read by launchd-runtime/bin/machine; the use-machine
+# skill says which job goes where. One source of truth, like repos.conf: a
+# hostname or MAC written anywhere else is a copy that drifts.
+#
+# Names are roles, not hardware. In this example the desktop is one machine that
+# boots Ubuntu (the default) or Windows, so it appears twice: `desktop-ubuntu`
+# and `desktop-windows` are never up at the same time, and `machine boot` is
+# what moves between them.
+#
+# The host is the MagicDNS name on the tailnet, which is how every machine here
+# reaches every other. An empty host means the machine is not on the tailnet yet:
+# the script refuses it with a line saying so, rather than guessing.
+
+# name → tailnet host
+get_machine_host() {
+    case "$1" in
+        m2)              echo "pipeline-mac" ;;  # pipeline host, always docked
+        m4)              echo "work-mac" ;;    # the human's workstation
+        desktop-ubuntu)  echo "gpu-box" ;;            # GPU box, woken on demand
+        desktop-windows) echo "gpu-box-win" ;;                   # same box, Windows boot
+        laptop)          echo "win-laptop" ;;           # the human's Windows laptop
+        pi)              echo "relay-pi" ;;                    # always on
+        *)               echo "" ;;
+    esac
+}
+
+# name → macos | linux | windows
+get_machine_os() {
+    case "$1" in
+        m2|m4)                  echo "macos" ;;
+        desktop-ubuntu|pi)      echo "linux" ;;
+        desktop-windows|laptop) echo "windows" ;;
+        *)                      echo "" ;;
+    esac
+}
+
+# name → the SSH user, for machines the pipeline logs into. Empty means the
+# pipeline has no login there (the laptop is the human's; the Macs are reached
+# through their own aliases).
+get_machine_user() {
+    case "$1" in
+        desktop-ubuntu)  echo "dev" ;;
+        desktop-windows) echo "devwin" ;; # OpenSSH, key login from the Macs
+        *)               echo "" ;;
+    esac
+}
+
+# The desktop's wake target. Both boots share this NIC. The broadcast address is
+# the LAN the pipeline host sits on, so it can wake the desktop itself.
+DESKTOP_WOL_MAC="02:00:00:AA:BB:CC"
+DESKTOP_WOL_BROADCAST="192.168.1.255"
+
+# The firmware's boot entry for Windows Boot Manager on the desktop, as
+# `efibootmgr` numbers it (e.g. 0003). Booting Windows is `efibootmgr --bootnext`
+# into this entry, once: the next boot after that is Ubuntu again, and Windows is
+# started through its own boot manager, so BitLocker sees its normal boot path.
+# Empty until someone reads it off the machine; `machine boot desktop windows`
+# refuses while it is empty.
+DESKTOP_WINDOWS_BOOT_ENTRY=""

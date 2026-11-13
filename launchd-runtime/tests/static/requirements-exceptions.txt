@@ -1,0 +1,28 @@
+# Repos in ACTIVE_REPOS whose host tooling is declared nowhere.
+#
+# test_requirements_manifests.sh fails the suite for an active repo that has
+# no manifest in its own checkout, no staged
+# `launchd-runtime/requirements-templates/<owner>-<repo>.conf`, and no line
+# here. That is the whole mechanism: a repo may go undeclared, but not
+# silently.
+#
+# A repo covered by a staged template is DECLARED, because check-requirements
+# falls back to that template and evaluates it. Listing such a repo here is a
+# stale exception, and the same test rejects one: an exception that no longer
+# applies reads as policy and hides the coverage that replaced it.
+#
+# One `owner/repo` per line, followed by ` # ` and the REASON it has none.
+# The reason is enforced — an undocumented exception is the thing this file
+# exists to prevent. Delete a line the moment that repo is covered.
+#
+# A manifest is never invented. "Nothing has failed on this host for want of
+# tooling" is a legitimate reason to have none; guessing at requirements
+# produces a checker that fails on things the project does not actually need,
+# which is how a gate teaches its reader to skip it.
+
+# paused with the StarBonk pilot (2026-10-13); restore when the repo returns to ACTIVE_REPOS:
+# amarcu/StarBonk-backend      # manifest written, awaiting merge in draft PR amarcu/StarBonk-backend#9 (node, npm, gh) — DELETE THIS LINE when it merges, or the checkout carries the file while this claims it does not
+# paused with the StarBonk pilot (2026-10-13); restore when the repo returns to ACTIVE_REPOS:
+# acme/agent-lab-platform  # manifest written, awaiting merge in draft PR acme/agent-lab-platform#93 (cargo, python3, gh) — DELETE THIS LINE when it merges, same reason
+# paused with the StarBonk pilot (2026-10-13); restore when the repo returns to ACTIVE_REPOS:
+# acme/agent-lab           # nothing to declare: the repo is generated from another one, so a manifest committed in it would be deleted by the next sync

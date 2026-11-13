@@ -1,0 +1,12 @@
+#!/bin/bash
+# Mock claude-cli whose stdout is not valid JSON (killed mid-write, or a
+# version that ignored --output-format). The sidecar is then the only record
+# of what happened, so the runner must copy it into the log verbatim.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.252 (Claude Code) [MOCK: json-unparseable]"
+    exit 0
+fi
+
+echo '{"type":"result","subtype":"success","total_cost_usd":0.4'
+exit 1

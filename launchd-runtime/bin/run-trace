@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+"""run-trace - one routine run as a timeline of its tool calls.
+
+Usage: run-trace <run-id> [metrics-dir]
+       run-trace --last <routine> [metrics-dir]
+       run-trace --runs [metrics-dir]
+
+Reads the two ledgers the runner's hooks write and merges them in time order:
+
+  tool-calls.jsonl     every completed tool call, with its duration
+                       (bin/record-tool-call, a PostToolUse hook)
+  tool-failures.jsonl  every failed one (bin/record-tool-failure)
+
+and prints, per step, when it finished, how long the run waited before it, the
+tool, how long the tool itself took, and a short label.
+
+A hook fires when its call completes, so a row's time is a completion time and
+the distance between two rows already contains the second tool's own duration.
+"waited" is that distance minus the duration: the time between one call ending
+and the next one starting, which is the model deciding what to do. It is an
+upper bound for a failed call, whose duration the failure event does not
+carry, and it is zero for calls that ran in parallel. Timestamps are whole
+seconds, so a short wait can read as 0s.
+
+A forked skill's calls reach the same hooks under the same run id (verified
+through _run.sh on 2026-11-12). They are listed before the Skill row that
+contains them, and that row's duration includes theirs, so the per-tool
+summary counts a worker's time twice: once under Skill and once under the
+tools the worker used.
+
+--last takes the most recent run of a routine. --runs lists the runs that have
+rows, newest last, with a step count, so there is something to pass.
+
+Read-only. Exit codes: 0 printed, 1 no rows for that run, 2 usage.
+"""
+import json
+import os
+import sys
+from datetime import datetime
+
+DEFAULT_DIR = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "metrics")
+
+
+def rows(path, kind):
+    """A ledger's rows, in file order. A half-written line is left out."""
+    out = []
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("run_id") and row.get("ts"):
+                    row["kind"] = kind
+                    out.append(row)
+    except OSError:
+        pass
+    return out
+
+
+def stamp(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return None
+
+
+def usage():
+    sys.stderr.write(__doc__.split("\n\n")[1] + "\n")
+    return 2
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help"):
+        return usage()
+    mode, want = "run", argv[0]
+    rest = argv[1:]
+    if argv[0] == "--last":
+        if len(argv) < 2:
+            return usage()
+        mode, want, rest = "last", argv[1], argv[2:]
+    elif argv[0] == "--runs":
+        mode, want = "runs", None
+    elif argv[0].startswith("-"):
+        return usage()
+    if len(rest) > 1:
+        return usage()
+    metrics = rest[0] if rest else os.environ.get("METRICS_DIR") or DEFAULT_DIR
+
+    steps = (rows(os.path.join(metrics, "tool-calls.jsonl"), "call")
+             + rows(os.path.join(metrics, "tool-failures.jsonl"), "FAIL"))
+    # Stable: rows with the same second keep ledger order, calls first.
+    steps.sort(key=lambda r: r["ts"])
+
+    if mode == "runs":
+        seen, order = {}, []
+        for r in steps:
+            if r["run_id"] not in seen:
+                order.append(r["run_id"])
+                seen[r["run_id"]] = [r["ts"], 0]
+            seen[r["run_id"]][1] += 1
+        for rid in order:
+            print("%s  %4d steps  %s" % (seen[rid][0], seen[rid][1], rid))
+        return 0
+
+    if mode == "last":
+        mine = [r["run_id"] for r in steps if r.get("routine") == want]
+        if not mine:
+            sys.stderr.write("run-trace: no rows for routine %s in %s\n" % (want, metrics))
+            return 1
+        want = mine[-1]
+    steps = [r for r in steps if r["run_id"] == want]
+    if not steps:
+        sys.stderr.write("run-trace: no rows for run %s in %s\n" % (want, metrics))
+        return 1
+
+    print("run %s  (%s)" % (want, steps[0].get("routine") or "no routine"))
+    print("%-8s %7s  %-5s %-12s %8s  %s" % ("done at", "waited", "", "tool", "took", "what"))
+    by_tool, prev, tool_ms, wait_s, fails = {}, None, 0, 0.0, 0
+    for r in steps:
+        at = stamp(r["ts"])
+        ms = r.get("duration_ms")
+        gap = ""
+        if prev is not None and at is not None:
+            waited = (at - prev).total_seconds()
+            if isinstance(ms, (int, float)):
+                waited -= ms / 1000.0
+            waited = max(waited, 0.0)
+            wait_s += waited
+            gap = "%ds" % int(round(waited))
+        prev = at or prev
+        took = "%.1fs" % (ms / 1000.0) if isinstance(ms, (int, float)) else "-"
+        # A call's label is already capped by the recorder, and a path keeps
+        # its end there; cutting it again here would cut the file name off.
+        what = r.get("what") if r["kind"] == "call" else str(r.get("error") or "")[:90]
+        print("%-8s %7s  %-5s %-12s %8s  %s" % (
+            r["ts"][11:19], gap, "" if r["kind"] == "call" else "FAIL",
+            str(r.get("tool") or "?")[:12], took, str(what or "")))
+        tool = str(r.get("tool") or "?")
+        entry = by_tool.setdefault(tool, [0, 0])
+        entry[0] += 1
+        if isinstance(ms, (int, float)):
+            entry[1] += ms
+            tool_ms += ms
+        if r["kind"] != "call":
+            fails += 1
+
+    print()
+    print("%d steps, %d failed: %.1fs inside tools, %.1fs waited between them"
+          % (len(steps), fails, tool_ms / 1000.0, wait_s))
+    for tool, (n, ms) in sorted(by_tool.items(), key=lambda kv: -kv[1][1]):
+        print("  %-12s %4d calls %8.1fs" % (tool[:12], n, ms / 1000.0))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

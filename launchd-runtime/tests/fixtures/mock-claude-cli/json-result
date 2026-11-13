@@ -1,0 +1,17 @@
+#!/bin/bash
+# Mock claude-cli emitting a successful --output-format json envelope whose
+# `result` — the run's final message — is read from $MOCK_RESULT_FILE, so a
+# test can hand the runner exactly the ending it wants to judge.
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.252 (Claude Code) [MOCK: json-result]"
+    exit 0
+fi
+/usr/bin/python3 -c '
+import json, sys
+print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                  "num_turns": 3, "total_cost_usd": 0.1, "session_id": "mock-session-result",
+                  "permission_denials": [], "result": open(sys.argv[1]).read(),
+                  "modelUsage": {"claude-sonnet-5": {"inputTokens": 1, "outputTokens": 1,
+                                  "cacheReadInputTokens": 0, "cacheCreationInputTokens": 0}}}))
+' "${MOCK_RESULT_FILE:?}"
+exit 0

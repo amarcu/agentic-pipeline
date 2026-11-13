@@ -1,0 +1,28 @@
+#!/bin/bash
+# merge-lane-night — the merge-lane-night routine's precheck. It runs bin/merge-lane for every
+# repo in MERGE_LANE_REPOS and never starts a model on a normal night.
+#
+# _run.sh calls it through ROUTINE_PRECHECK. Exit 10 tells the runner "done, do not start the
+# model": it logs everything printed here and ends the run at no cost. Any other exit means
+# the lane itself failed, and the runner starts the model on prompts/merge-lane-night.md, which
+# only reports the failure — the model can never merge, because the deny-net blocks it.
+#
+# The first line printed is the run summary (the runner records it as the skip reason).
+set -u
+HERE=$(cd "$(/usr/bin/dirname "$0")" && pwd)
+CONF="${REPOS_CONF:-$HERE/../repos.conf}"
+LANE="${MERGE_LANE_BIN:-$HERE/merge-lane}"
+. "$CONF" || { echo "MERGE-LANE-RUN: error reason=cannot read $CONF"; exit 1; }
+
+OUT=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/merge-lane-night.XXXXXX") || exit 1
+status=0
+for repo in "${MERGE_LANE_REPOS[@]+"${MERGE_LANE_REPOS[@]}"}"; do
+    "$LANE" "$repo" >> "$OUT" 2>&1 || status=1
+done
+
+count() { /usr/bin/grep -c "result=$1" "$OUT" 2>/dev/null || true; }
+echo "MERGE-LANE-RUN: merged=$(count merged) waiting=$(count waiting) batch=$(count batch) skipped=$(count skipped) errors=$(count error) status=$status"
+/bin/cat "$OUT"
+/bin/rm -f "$OUT"
+[ "$status" -eq 0 ] && exit 10
+exit 1

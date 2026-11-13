@@ -1,0 +1,561 @@
+#!/usr/bin/python3
+"""Evaluate a project's `agent/requirements.conf` against this host.
+
+Usage: check-requirements <owner/repo> [--json] [--quiet]
+       check-requirements --all      [--json] [--quiet]
+
+Two nights of evidence motivated this. On 2026-09-07 two GameTwo workers
+each burned a dispatch slot and halted at the very end: the game-engine
+checkout the Mac client links against was not on disk and full Xcode was
+absent, so `xcodebuild` could not run — one worker committed eight lines
+locally and then refused to open a PR. Separately `pr-review-bundle` could
+build no bundle at all on the pipeline host, because gh 2.63.2 (Dec 2024)
+serves no `closingIssuesReferences`. Neither gap was declared anywhere, so the
+only way to discover either was to spend a worker on it.
+
+A manifest declares them. This reads one and answers, before the work starts,
+whether this host can do the job.
+
+Exit codes:
+    0   every required requirement passed — including a repo with no manifest,
+        and a repo whose manifest is `gate: advisory` and failed on an ABSENT
+        requirement
+    1   a required requirement failed, or the manifest has a line this cannot
+        parse, or a `cmd` is present but below its declared `>=` floor under
+        any gate (or, with --all, any of those happened in any repo)
+    2   usage error, or the repo is not in repos.conf's get_repo_path map
+
+`advisory` covers ABSENCE and nothing else. A `cmd` that is installed but older
+than its `>=` floor is not absent: the tool is there and the project has said
+its output cannot be trusted, so downgrading that to `no-gate` would hand the
+work a verify step the project already declared untrustworthy. StarBonk is the
+worked example — `cmd unity >=1.0.0-beta.8` exists because Unity Hub's beta.5
+reports a failed test and a failed compile both as exit 6, and `bin/unity-gate`
+refuses it for that reason. Under a plain advisory downgrade the floor would
+protect nothing: the caller would skip the very gate that catches beta.5, and a
+manifest declaring the floor would end up WEAKER than no manifest at all. So a
+failed floor exits 1 whatever the gate says, and the summary line names it as
+`below-floor=<names>`.
+
+A line this cannot parse fails the WHOLE check, in every mode including
+--quiet, and says which line: an unrecognised verb or a malformed version spec
+means a requirement is silently not being checked, and a checker that reports
+`ok` over an unchecked requirement is the exact failure this exists to remove.
+`advisory` does not soften it — the gate says what to do when a requirement is
+absent, not when the file cannot be read.
+
+Absence is never a refusal: a repo with neither an `agent/requirements.conf`
+nor a staged template exits 0 with `REQ: <owner/repo> no-manifest`. Every repo
+is unmigrated on the day this lands, and a checker that blocked on absence
+would stop all of them at once.
+
+A manifest belongs in the project's own repo, so the checkout is read first.
+When it has none, `../requirements-templates/<owner>-<repo>.conf` is used
+instead and every line reporting that repo carries `(template)`. Two repos
+motivated this whole script and neither could take a commit on the day it was
+written — GameTwo and StarBonk both had dirty trees — so a checker that only
+ever read the checkout covered neither of the gaps it exists for. The template
+is a fallback and never a shadow: an in-repo manifest always wins, and the
+`(template)` marker is there so nobody debugs a result against the wrong file.
+
+`cmd` is resolved against the PATH THIS PROCESS INHERITED, which is the point:
+run from inside a routine it answers for the routine, because the LaunchAgent
+plist sets PATH explicitly (the Unity routines add ~/.unity/bin and the others
+do not). Run from an interactive shell it answers for that shell, which is
+usually more permissive — `make doctor` on a developer's terminal can pass
+where the 04:10 run would not. The `path` printed by --json is what was
+searched, so a disagreement is diagnosable rather than mysterious.
+
+The repo path comes from repos.conf's own `get_repo_path`, sourced through
+bash rather than re-parsed here. The map is a bash `case` because macOS ships
+bash 3.2; re-implementing it in Python would make this the second place that
+knows how a repo name becomes a path, which is exactly the drift repos.conf
+exists to prevent. One /bin/bash per invocation is the price.
+
+No third-party modules: /usr/bin/python3 is the only interpreter guaranteed on
+the pipeline host (same reason routine-cost and spend-today are Python).
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "repos.conf"
+)
+
+MANIFEST_RELPATH = os.path.join("agent", "requirements.conf")
+
+TEMPLATES_DIR = os.environ.get("REQUIREMENTS_TEMPLATES") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "requirements-templates"
+)
+
+VERBS = ("cmd", "path", "env", "check")
+
+# How long one probe may take. `gh auth status` reaches the network and
+# `xcodebuild -version` can wake a cold Xcode, so the budget is generous —
+# but it is bounded, because this runs before work and must never be the
+# thing that hangs a routine.
+PROBE_TIMEOUT = 30
+
+# The first version-like token in a --version line: a dotted release, with an
+# optional pre-release tail. Anchored on a digit run so "gh version 2.92.0
+# (2026-04-28)" yields 2.92.0 and not the release date.
+VERSION_RE = re.compile(r"\d+(?:\.\d+)+(?:-[0-9A-Za-z.]+)?")
+
+# The ONLY shapes a `cmd` line may take: a name, optionally followed by `>=`
+# and a version. `>=` is the one operator there is — a minimum is the only
+# thing a host check can act on — and anything else is refused rather than
+# interpreted. Refused, because the permissive parse this replaced discarded
+# the operator entirely: `cmd gh <2.92` was evaluated as `>=2.92`, silently
+# inverting what its author wrote, and `cmd gh >=2.92 and some junk` quietly
+# swallowed the junk.
+CMD_SPEC_RE = re.compile(r"^(\S+)(?:\s+>=\s*(\S+))?$")
+
+
+# ── repos.conf ────────────────────────────────────────────────────────────
+
+def conf_query(snippet, arg=""):
+    """Run `snippet` with repos.conf sourced. Returns stdout, or None."""
+    proc = subprocess.run(
+        ["/bin/bash", "-c", '. "$1" >/dev/null 2>&1 || exit 3\n' + snippet,
+         "check-requirements", os.path.abspath(REPOS_CONF), arg],
+        capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
+
+
+def repo_path(repo):
+    out = conf_query('get_repo_path "$2"', repo)
+    return (out or "").strip()
+
+
+def active_repos():
+    out = conf_query('printf "%s\\n" "${ACTIVE_REPOS[@]}"')
+    return [line.strip() for line in (out or "").split("\n") if line.strip()]
+
+
+# ── Manifest parsing ──────────────────────────────────────────────────────
+
+class Requirement:
+    def __init__(self, verb, spec, hint, install, lineno):
+        self.verb = verb
+        self.spec = spec
+        self.name = ""      # cmd only: the executable, parsed once, at parse time
+        self.minimum = None # cmd only: the parsed floor, or None for "any version"
+        self.hint = hint
+        self.install = install
+        self.lineno = lineno
+        self.status = "ok"          # ok | missing | warn
+        self.below_floor = False    # cmd only: installed, but older than `minimum`
+        self.detail = ""
+
+    @property
+    def label(self):
+        """The short name this requirement is reported as when it fails."""
+        return self.name if self.verb == "cmd" else self.spec
+
+    def as_dict(self):
+        return {"verb": self.verb, "spec": self.spec, "label": self.label,
+                "status": self.status, "below_floor": self.below_floor,
+                "detail": self.detail, "hint": self.hint, "install": self.install}
+
+
+def split_annotations(line):
+    """(spec, hint, install) — annotations start at the first ' #'.
+
+    A `#` preceded by whitespace opens the annotation section on EVERY line,
+    `check` included: the file is line-based config in this repo's house style
+    (see permissions/protected-roots.conf), not a shell script. A command that
+    needs a literal hash has to avoid the space before it.
+    """
+    head, sep, tail = line.partition(" #")
+    spec = head.strip()
+    hint = install = ""
+    if sep:
+        for segment in tail.split(" #"):
+            segment = segment.strip()
+            if segment.lower().startswith("hint:"):
+                hint = segment[len("hint:"):].strip()
+            elif segment.lower().startswith("install:"):
+                install = segment[len("install:"):].strip()
+    return spec, hint, install
+
+
+def parse_manifest(path):
+    """(gate, requirements, errors) for one manifest file."""
+    gate = "required"
+    requirements, errors = [], []
+    seen_requirement = False
+
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for lineno, raw in enumerate(handle, 1):
+            line = raw.rstrip("\n")
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+
+            if line.lower().startswith("gate:"):
+                # Only as the first directive: a gate declared halfway down
+                # would silently apply to lines above it too.
+                value = line.split(":", 1)[1].strip().lower()
+                if seen_requirement:
+                    errors.append("line %d: gate: must come before any requirement" % lineno)
+                elif value in ("required", "advisory"):
+                    gate = value
+                else:
+                    errors.append("line %d: unknown gate '%s' (required|advisory)" % (lineno, value))
+                continue
+
+            spec, hint, install = split_annotations(line)
+            parts = spec.split(None, 1)
+            if not parts:
+                continue
+            verb, rest = parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
+            if verb not in VERBS:
+                errors.append("line %d: unknown verb '%s' (%s)" % (lineno, verb, "|".join(VERBS)))
+                continue
+            if not rest:
+                errors.append("line %d: '%s' needs an argument" % (lineno, verb))
+                continue
+            requirement = Requirement(verb, rest, hint, install, lineno)
+
+            if verb == "env" and len(rest.split()) > 1:
+                errors.append("line %d: 'env %s' names more than one variable"
+                              % (lineno, rest))
+                continue
+
+            if verb == "cmd":
+                match = CMD_SPEC_RE.match(rest)
+                if not match:
+                    errors.append("line %d: '%s' is not `cmd <name>` or `cmd <name> >=<version>` "
+                                  "(>= is the only operator)" % (lineno, rest))
+                    continue
+                requirement.name, wanted = match.group(1), match.group(2)
+                if wanted:
+                    requirement.minimum = parse_version(wanted)
+                    if requirement.minimum is None:
+                        errors.append("line %d: '%s' is not a version %s can be compared against"
+                                      % (lineno, wanted, requirement.name))
+                        continue
+
+            seen_requirement = True
+            requirements.append(requirement)
+
+    return gate, requirements, errors
+
+
+# ── Versions ──────────────────────────────────────────────────────────────
+
+def parse_version(text):
+    """((release ints), (pre-release ints) or None), or None when unreadable."""
+    match = VERSION_RE.search(text or "")
+    if not match:
+        return None
+    release, _, pre = match.group(0).partition("-")
+    return (tuple(int(n) for n in re.findall(r"\d+", release)),
+            tuple(int(n) for n in re.findall(r"\d+", pre)) if pre else None)
+
+
+def version_at_least(found, minimum):
+    """found >= minimum, treating a release as newer than its pre-releases.
+
+    Unity's CLI is the reason the pre-release half exists: the gate needs
+    1.0.0-beta.8 or newer, and a naive component compare would read a future
+    1.0.0 GA as older than the beta it succeeds.
+    """
+    f_rel, f_pre = found
+    m_rel, m_pre = minimum
+    width = max(len(f_rel), len(m_rel))
+    f_rel += (0,) * (width - len(f_rel))
+    m_rel += (0,) * (width - len(m_rel))
+    if f_rel != m_rel:
+        return f_rel > m_rel
+    if f_pre is None:
+        return True
+    if m_pre is None:
+        return False
+    width = max(len(f_pre), len(m_pre))
+    return f_pre + (0,) * (width - len(f_pre)) >= m_pre + (0,) * (width - len(m_pre))
+
+
+def probe_version(name):
+    """The raw first line of `<name> --version`, or None if it cannot be read."""
+    try:
+        proc = subprocess.run([name, "--version"], capture_output=True,
+                              text=True, timeout=PROBE_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = (proc.stdout or "") + (proc.stderr or "")
+    for line in text.split("\n"):
+        if line.strip():
+            return line.strip()
+    return None
+
+
+# ── Evaluation ────────────────────────────────────────────────────────────
+
+def evaluate(req, root):
+    if req.verb == "cmd":
+        evaluate_cmd(req)
+    elif req.verb == "path":
+        target = os.path.expanduser(req.spec)
+        if not os.path.isabs(target):
+            target = os.path.join(root, target)
+        target = os.path.normpath(target)
+        req.detail = target
+        if not os.path.exists(target):
+            req.status = "missing"
+    elif req.verb == "env":
+        if not (os.environ.get(req.spec) or "").strip():
+            req.status = "missing"
+            req.detail = "unset or empty"
+    elif req.verb == "check":
+        try:
+            proc = subprocess.run(["/bin/sh", "-c", req.spec], capture_output=True,
+                                  text=True, timeout=PROBE_TIMEOUT, cwd=root)
+        except subprocess.TimeoutExpired:
+            req.status = "missing"
+            req.detail = "timed out after %ds" % PROBE_TIMEOUT
+            return
+        except OSError as err:
+            req.status = "missing"
+            req.detail = str(err)
+            return
+        if proc.returncode != 0:
+            req.status = "missing"
+            first = ((proc.stderr or "") + (proc.stdout or "")).strip().split("\n")[0]
+            req.detail = "exit %d%s" % (proc.returncode, ": " + first if first else "")
+
+
+def evaluate_cmd(req):
+    """`req.name` and `req.minimum` were parsed and validated by parse_manifest.
+
+    Nothing re-derives them here: the permissive re-parse that used to live in
+    this function is exactly how the two halves came to disagree about what a
+    line meant.
+    """
+    found = shutil.which(req.name)
+    if not found:
+        req.status = "missing"
+        req.detail = "not on PATH"
+        return
+    req.detail = found
+    if req.minimum is None:
+        return
+
+    line = probe_version(req.name)
+    actual = parse_version(line or "")
+    wanted = req.spec.split(">=", 1)[1].strip()
+    if actual is None:
+        # A warning, never a failure. The tool IS installed; only its
+        # self-report is unreadable, and failing there would block work over
+        # a vendor's formatting change.
+        req.status = "warn"
+        req.detail = "installed, version unreadable (%s); wanted >=%s" % (
+            (line or "no --version output"), wanted)
+        return
+    if not version_at_least(actual, req.minimum):
+        # Not the same failure as "not on PATH", and check_repo needs the
+        # difference: `gate: advisory` may downgrade an absent tool and must
+        # not downgrade this one.
+        req.status = "missing"
+        req.below_floor = True
+        req.detail = "%s installed, wanted >=%s" % (line, wanted)
+    else:
+        req.detail = "%s (%s)" % (found, line)
+
+
+def template_path(repo):
+    """The manifest staged for `repo` in requirements-templates/, or None.
+
+    `<owner>-<repo>.conf`, which is the name a static test already enforces so
+    that a template always says which repo it belongs to.
+    """
+    path = os.path.join(TEMPLATES_DIR, repo.replace("/", "-", 1) + ".conf")
+    return path if os.path.isfile(path) else None
+
+
+def check_repo(repo):
+    """Evaluate one repo. Returns a result dict; never raises on a bad manifest."""
+    root = repo_path(repo)
+    result = {"repo": repo, "path": root, "manifest": None, "source": None,
+              "gate": None, "status": "no-manifest", "missing": [],
+              "below_floor": [], "warnings": [], "errors": [], "requirements": []}
+    if not root:
+        result["status"] = "unresolved"
+        result["errors"] = ["%s is not in repos.conf's get_repo_path map" % repo]
+        return result
+    if not os.path.isdir(root):
+        result["status"] = "unresolved"
+        result["errors"] = ["%s resolves to %s, which does not exist" % (repo, root)]
+        return result
+
+    manifest, source = os.path.join(root, MANIFEST_RELPATH), "repo"
+    if not os.path.isfile(manifest):
+        manifest, source = template_path(repo), "template"
+        if not manifest:
+            return result
+
+    result["manifest"] = manifest
+    result["source"] = source
+    gate, requirements, errors = parse_manifest(manifest)
+    result["gate"] = gate
+    result["errors"] = errors
+    if errors:
+        # Fatal, and before any probing: the file does not say what it means,
+        # so nothing it does say can be trusted to be the whole list.
+        result["status"] = "manifest-error"
+        return result
+
+    for req in requirements:
+        evaluate(req, root)
+        if req.status == "missing":
+            result["missing"].append(req.label)
+            if req.below_floor:
+                result["below_floor"].append(req.label)
+        elif req.status == "warn":
+            result["warnings"].append(req.label)
+    result["requirements"] = [r.as_dict() for r in requirements]
+
+    if result["missing"]:
+        # `advisory` says what to do when a requirement is ABSENT. A tool
+        # installed below its declared floor is present and untrustworthy,
+        # which is the case the floor was written for — see the module
+        # docstring on why downgrading it makes the manifest worse than none.
+        result["status"] = ("missing" if gate == "required" or result["below_floor"]
+                            else "advisory")
+    else:
+        result["status"] = "ok"
+    return result
+
+
+# ── Reporting ─────────────────────────────────────────────────────────────
+
+STATUS_MARK = {"ok": "ok     ", "warn": "warn   ", "missing": "MISSING"}
+
+
+def summary_line(result):
+    """The one parsable line a caller greps for.
+
+    A repo read from a staged template ends every line with ` (template)`: the
+    caller is acting on a file that is not in the checkout it names, and a
+    reader who does not know that debugs the wrong file.
+    """
+    repo, status = result["repo"], result["status"]
+    if status == "no-manifest":
+        return "REQ: %s no-manifest" % repo
+    if status == "unresolved":
+        return "REQ: %s unresolved" % repo
+    tail = " (template)" if result["source"] == "template" else ""
+    if status == "manifest-error":
+        return "REQ: %s manifest-error %s%s" % (repo, "; ".join(result["errors"]), tail)
+    if status == "ok":
+        return "REQ: %s ok%s" % (repo, tail)
+    names = ", ".join(result["missing"])
+    if status == "advisory":
+        return "REQ: %s advisory missing=%d (%s) gate=no-gate%s" % (
+            repo, len(result["missing"]), names, tail)
+    # `below-floor=` is why an `advisory` manifest can still land here: it
+    # names the requirements that are installed but older than their floor.
+    floor = (" below-floor=%s" % ",".join(result["below_floor"])
+             if result["below_floor"] else "")
+    return "REQ: %s missing=%d (%s)%s%s" % (
+        repo, len(result["missing"]), names, floor, tail)
+
+
+def print_detail(result):
+    """One line per requirement, plus the hint under each failure."""
+    if result["manifest"]:
+        print("%s — %s (gate: %s)" % (result["repo"], result["manifest"], result["gate"]))
+    for req in result["requirements"]:
+        line = "  %s %s %s" % (STATUS_MARK[req["status"]], req["verb"], req["spec"])
+        if req["detail"]:
+            line += "  [%s]" % req["detail"]
+        print(line)
+        if req["status"] == "missing" and req["hint"]:
+            print("          hint: %s" % req["hint"])
+    for err in result["errors"]:
+        print("  ERROR   %s" % err)
+
+
+def print_table(results):
+    width = max([len(r["repo"]) for r in results] + [4])
+    print("%-*s  %-8s  %-11s  %s" % (width, "repo", "gate", "status", "missing"))
+    for result in results:
+        print("%-*s  %-8s  %-11s  %s" % (
+            width, result["repo"], result["gate"] or "-",
+            "MISSING" if result["status"] == "missing" else result["status"],
+            ", ".join(result["missing"] or result["errors"]) or "-"))
+    counts = {"ok": 0, "missing": 0, "advisory": 0, "no-manifest": 0,
+              "unresolved": 0, "manifest-error": 0}
+    for result in results:
+        counts[result["status"]] = counts.get(result["status"], 0) + 1
+    print("TOTAL %d repos: %d ok, %d missing, %d manifest-error, %d advisory, "
+          "%d no-manifest, %d unresolved" % (
+              len(results), counts["ok"], counts["missing"], counts["manifest-error"],
+              counts["advisory"], counts["no-manifest"], counts["unresolved"]))
+    staged = [r["repo"] for r in results if r["source"] == "template"]
+    if staged:
+        print("NOTE: %d repo(s) checked against a staged template rather than their own "
+              "%s: %s" % (len(staged), MANIFEST_RELPATH, ", ".join(staged)))
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="check-requirements", add_help=True,
+        description="Check a project's agent/requirements.conf against this host.")
+    parser.add_argument("repo", nargs="?", help="owner/repo")
+    parser.add_argument("--all", action="store_true",
+                        help="every repo in repos.conf's ACTIVE_REPOS (make doctor)")
+    parser.add_argument("--json", action="store_true",
+                        help="one JSON object per repo, one per line")
+    parser.add_argument("--quiet", action="store_true",
+                        help="the summary line only, no per-requirement detail")
+    args = parser.parse_args()
+
+    if args.all == bool(args.repo):
+        parser.print_usage(sys.stderr)
+        print("check-requirements: give one <owner/repo>, or --all", file=sys.stderr)
+        return 2
+
+    if not os.path.isfile(REPOS_CONF):
+        print("check-requirements: repos.conf not found at %s" % REPOS_CONF, file=sys.stderr)
+        return 2
+
+    if args.all:
+        repos = active_repos()
+        if not repos:
+            print("check-requirements: ACTIVE_REPOS is empty in %s" % REPOS_CONF,
+                  file=sys.stderr)
+            return 2
+    else:
+        repos = [args.repo]
+
+    results = [check_repo(repo) for repo in repos]
+
+    if args.json:
+        for result in results:
+            print(json.dumps(result))
+    else:
+        for result in results:
+            if not args.quiet and (result["requirements"] or result["errors"]):
+                print_detail(result)
+            if not args.all:
+                print(summary_line(result))
+        if args.all:
+            print_table(results)
+
+    if any(r["status"] == "unresolved" for r in results):
+        for result in results:
+            for err in result["errors"]:
+                print("check-requirements: %s" % err, file=sys.stderr)
+        return 2
+    return 1 if any(r["status"] in ("missing", "manifest-error") for r in results) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,18 @@
+#!/bin/bash
+# Mock claude-cli whose --output-format json envelope carries a denial, in the
+# shape a headless run reported one on 2026-09-13: tool_name, tool_use_id and
+# the exact tool_input the deny-net refused.
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.252 (Claude Code) [MOCK: json-denials]"
+    exit 0
+fi
+cat <<'JSON'
+{"type":"result","subtype":"success","is_error":false,"num_turns":4,
+ "total_cost_usd":0.21,"session_id":"mock-session-denials",
+ "permission_denials":[{"tool_name":"Bash","tool_use_id":"toolu_01",
+   "tool_input":{"command":"gh pr ready 12 --repo amarcu/StarBonk"}}],
+ "result":"HALT: dispatch-tasks denied",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":2,"outputTokens":40,
+  "cacheReadInputTokens":900,"cacheCreationInputTokens":300,"costUSD":0.21}}}
+JSON
+exit 0

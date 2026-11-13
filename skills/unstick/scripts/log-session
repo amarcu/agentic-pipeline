@@ -1,0 +1,34 @@
+#!/bin/bash
+# log-session - append one dated line to the unstick session log.
+#
+# Usage: log-session "<key=value ...>"
+#
+# One sitting is one line, so "is the review loop actually running" is a grep
+# over weeks rather than a reading of transcripts. The logs directory is the
+# live runtime's own record (CLAUDE.md, permissions/protected-roots.conf):
+# this opens the log for append and does nothing else - `>>` never truncates,
+# and a missing directory is an error rather than something to create.
+#
+# Exit codes: 0 appended, 2 usage (no text, several arguments, or more than
+# one line), 3 the log directory does not exist or the append failed.
+set -u
+
+LOG="${UNSTICK_LOG:-${AGENTIC_SKILLS_HOME:-$HOME/.agentic-skills}/routines/logs/unstick.log}"
+
+if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    echo "log-session: give the session line as exactly one argument" >&2
+    exit 2
+fi
+case "$1" in
+    *$'\n'*|*$'\r'*) echo "log-session: the session line must be one line" >&2; exit 2 ;;
+esac
+
+dir=$(/usr/bin/dirname "$LOG")
+if [ ! -d "$dir" ]; then
+    echo "log-session: $dir does not exist on this machine" >&2
+    exit 3
+fi
+
+line="$(/bin/date +%Y-%m-%dT%H:%M:%S%z) $1"
+printf '%s\n' "$line" >> "$LOG" || exit 3
+echo "SESSION: $line"

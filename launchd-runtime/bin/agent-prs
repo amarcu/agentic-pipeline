@@ -1,0 +1,44 @@
+#!/bin/bash
+# agent-prs — the open pull requests an agent shipped, and nothing else.
+#
+# Usage: agent-prs <owner/repo> [--draft-only]
+# Prints one line per agent PR, oldest first: `<number>\t<head branch>\t<draft|ready>\t<updatedAt>`.
+#
+# An agent PR is one whose head branch starts with `task/issue-<N>-` (what
+# work-on-task names every branch it creates) or `worktree-issue-<N>` (the older
+# worker's name). Branch names are the only tell: the worker, the reviewer and the
+# human all post as the same GitHub account, and a human PR says `Closes #<n>` as
+# readily as an agent's, so neither authorship nor the body can separate them.
+#
+# The pipeline's review and iterate lanes act on these PRs only. On 2026-09-26
+# the reassessment found pr-iterate-night had pushed commits onto two of the
+# human's own GameTwo branches (#99, #158), because it chose every draft with
+# unanswered feedback. The human decided that Claude reviews only what the agents
+# shipped autonomously.
+#
+# Exit codes: 0 listed (possibly nothing), 1 the query failed, 2 usage.
+set -u
+
+REPO="${1:-}"
+DRAFT_ONLY=0
+[[ "${2:-}" == "--draft-only" ]] && DRAFT_ONLY=1
+if [[ ! "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]; then
+    echo "usage: agent-prs <owner/repo> [--draft-only]" >&2
+    exit 2
+fi
+
+GH=$(command -v gh || echo "$HOME/.local/bin/gh")
+JQ=$(command -v jq || { for j in /usr/bin/jq /opt/homebrew/bin/jq /usr/local/bin/jq "$HOME/.local/bin/jq"; do [[ -x "$j" ]] && { echo "$j"; break; }; done; })
+[[ -x "$GH" && -x "${JQ:-}" ]] || { echo "agent-prs: gh or jq not found" >&2; exit 1; }
+
+if ! prs=$("$GH" pr list --repo "$REPO" --state open --limit 200 \
+        --json number,headRefName,isDraft,updatedAt 2>/dev/null); then
+    echo "agent-prs: could not list pull requests for $REPO" >&2
+    exit 1
+fi
+
+printf '%s' "$prs" | "$JQ" -r --argjson draft_only "$DRAFT_ONLY" '
+    map(select(.headRefName | test("^(task/issue-[0-9]+-|worktree-issue-[0-9]+)")))
+    | map(select($draft_only == 0 or .isDraft))
+    | sort_by(.updatedAt)
+    | .[] | "\(.number)\t\(.headRefName)\t\(if .isDraft then "draft" else "ready" end)\t\(.updatedAt)"'

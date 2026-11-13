@@ -1,0 +1,563 @@
+#!/usr/bin/python3
+"""pr-review-round — the mechanical half of one Copilot review round.
+
+Every PR this pipeline opens goes through several rounds of Copilot review, and
+until now a human drove all of them: read the comments, hand them to a worker,
+re-request the review, repeat. PR #35 took four rounds in one day. The judgement
+— is this finding valid — has to stay with a model. The mechanics do not, and
+this is the mechanics: request, wait, collect what is still unanswered, decide
+whether the round is green.
+
+Three subcommands, each over one pull request:
+
+  request [--force]        ask Copilot for a review unless one is pending, or
+                           this head SHA has already been reviewed
+  wait                     block until Copilot reviews THIS head commit
+  status [--json]          the latest verdict, plus every finding nobody answered
+
+Green is the conjunction of two things and never either one alone: the latest
+Copilot review's verdict line says 🟢, AND no root review comment is still
+without a reply. A review can carry its findings only in the summary body with
+no inline comment at all, so "nothing unanswered" is not by itself a verdict;
+and a 🟢 review posted before someone left an inline note is not one either.
+
+All three subcommands turn out to ask one question — is there a Copilot review
+OF THIS COMMIT — and they ask it through one function, `pick_head_review`. They
+did not always: `wait` matched on time alone, `status` took the newest review
+whatever it was of, and `request` compared the head against whatever was reviewed
+most recently. Three parallel implementations, two of them wrong in the same way,
+and each wrong one produced a green on a commit nobody had reviewed. One
+question, one answer, three callers.
+
+The question is about ONE commit: the head as it stood when the subcommand began.
+A review whose `commit_id` is any other commit does not answer for it, however
+recently it was submitted. Reviews of an earlier head do arrive late — Copilot answered two
+requests against the same commit twelve minutes apart on amarcu/agentic-pipeline
+\#35 — and a late one is newer than the review that matters, so "the newest
+review" is not the same thing as "this commit's review". The whole point of the
+round is a verdict on THIS push. `--since` is a second, weaker bound on the same
+idea and defaults to the moment `wait` starts, so a caller needs no clock of its
+own: the loop runs `request` and then `wait`, and only a review submitted from
+then on, against that head, ends it.
+
+Everything here fails loudly. A `gh` call that exits non-zero, or hands back
+JSON that will not parse, is a named error on stderr and a non-zero exit —
+never an empty list, which a caller would read as "nothing to answer, therefore
+green". That is the one failure mode this script exists to make impossible.
+
+Exit codes:
+  0  the subcommand succeeded — for `status`, that means green
+  1  `status` only: not green. The verdict is not 🟢, findings are unanswered,
+     or the head commit carries no Copilot review (`no-review`) — whether the PR
+     has never been reviewed or was reviewed before the commits now on it
+  2  usage, or a gh call that failed or returned something unreadable
+  3  `request` only: no review request was created — verified, not assumed
+  4  `wait` only: the timeout expired with no new review. NOT a green light
+  5  `wait` and `status`: `quota-exhausted`. Copilot answered that it could not
+     review at all, because the requester is out of review quota. The round did
+     not happen, so this is neither a verdict nor a timeout — a caller must stop
+     rather than spend its remaining rounds against a wall
+  6  `request` only: this head SHA already carries a Copilot verdict, so a fresh
+     request would be billed again for an answer already on the PR. `--force`
+     overrides it
+
+Usage:
+  pr-review-round request <owner/repo> <pr> [--force]
+  pr-review-round wait    <owner/repo> <pr> [--since <ISO8601>]
+                                            [--timeout-mins 12] [--poll-secs 60]
+  pr-review-round status  <owner/repo> <pr> [--json]
+
+Read-only apart from `request`. No third-party modules: /usr/bin/python3 is the
+only interpreter guaranteed on the pipeline host (same reason `pr-feedback` and
+`routine-cost` are plain Python).
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+
+# The reviewer slug the REST endpoint actually acts on. `-f reviewers[]=Copilot`
+# is accepted and does nothing: measured on amarcu/agentic-pipeline#35 on
+# 2026-09-08, the `review_requested` timeline count stayed where it was, and
+# with the bot login below it moved 2 → 3. Nothing in the HTTP response
+# distinguishes the two, which is why `request` verifies afterwards.
+COPILOT_REVIEWER = "copilot-pull-request-reviewer[bot]"
+
+# Every login GitHub hands back for that one reviewer: `Copilot` from REST (id
+# 175728472), `copilot-pull-request-reviewer` from the GraphQL Bot node
+# (BOT_kgDOCnlnWA). One prefix covers both, and covers a `[bot]` suffix too.
+COPILOT_PREFIX = "copilot"
+
+# The verdict line Copilot opens its review body with: `### 🟢 Approval
+# recommended`, `### 🟡 Changes recommended`, `### 🔵 Needs a closer look`.
+# Anything that is not 🟢 is not green.
+VERDICT_MARKS = (("🟢", "green"), ("🟡", "changes"), ("🔵", "closer-look"))
+
+# Copilot answers a request it cannot serve with a plain sentence and no verdict
+# line at all: "Copilot was unable to review this pull request because the user
+# who requested the review has reached their quota limit." Seen on
+# amarcu/agentic-pipeline#35 on 2026-09-08, as the review that followed four
+# rounds in one day. Both phrases have to be present, anywhere in a body that
+# opened with no verdict mark.
+QUOTA_PHRASES = ("unable to review", "quota")
+
+# A Copilot review is metered per invocation: GitHub bills it in AI credits to
+# whoever requested it, and consumption happens "each time Copilot reviews a pull
+# request" — there is no de-duplication for a re-request on an unchanged head
+# SHA. The allowance resets at 00:00 UTC on the first of the calendar month, so
+# an exhausted one does not come back the same day. It is not hypothetical:
+# amarcu/agentic-pipeline#35 has two reviews against commit 01ba178b, twelve
+# minutes apart, the second bought with the human's allowance and saying what
+# the first already said. Hence the guard in `request`.
+
+GH_TIMEOUT_SECS = 300
+
+# `requestedReviewer` is a union; a Bot node is the only shape Copilot arrives
+# in, and __typename is what separates it from a human called "copilot".
+REQUESTS_QUERY = """
+query($owner: String!, $repo: String!, $pr: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewRequests(first: 50) {
+        nodes {
+          requestedReviewer {
+            __typename
+            ... on Bot { login }
+            ... on User { login }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+GH = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+
+
+def die(code, msg):
+    print("pr-review-round: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def gh_attempt(args):
+    """Run gh and hand back the result, non-zero exit included.
+
+    Only `request` wants that: it has to tell "the POST failed" apart from "the
+    POST succeeded and changed nothing", and both end in the same exit 3.
+    """
+    try:
+        return subprocess.run([GH, *args], capture_output=True, text=True,
+                              timeout=GH_TIMEOUT_SECS)
+    except OSError as exc:
+        die(2, "cannot run gh at %s: %s" % (GH, exc))
+    except subprocess.TimeoutExpired:
+        die(2, "gh %s timed out after %ds" % (" ".join(args), GH_TIMEOUT_SECS))
+
+
+def gh_run(args):
+    out = gh_attempt(args)
+    if out.returncode != 0:
+        die(2, "gh %s exited %d: %s"
+            % (" ".join(args), out.returncode, out.stderr.strip()[:300]))
+    return out.stdout
+
+
+def gh_json(args, what):
+    """A gh call whose output must parse as JSON, or the run stops here."""
+    text = gh_run(args).strip()
+    if not text:
+        die(2, "gh %s printed nothing where %s was expected" % (" ".join(args), what))
+    try:
+        return json.loads(text)
+    except ValueError as exc:
+        die(2, "gh %s returned unparsable JSON for %s: %s"
+            % (" ".join(args), what, exc))
+
+
+def gh_rest(path, what):
+    """One paginated read-only call, flattened.
+
+    --slurp separates pages structurally, so a comment body containing '][' is
+    not mistaken for a page boundary — the convention `pr-feedback` set.
+    """
+    pages = gh_json(["api", "--paginate", "--slurp", path], what)
+    if not isinstance(pages, list) or any(not isinstance(p, list) for p in pages):
+        die(2, "gh api %s did not return the list of pages %s needs" % (path, what))
+    return [item for page in pages for item in page if isinstance(item, dict)]
+
+
+def is_copilot(login):
+    return str(login or "").lower().startswith(COPILOT_PREFIX)
+
+
+def parse_ts(text, what):
+    """An ISO-8601 instant as an aware datetime, or None when `text` is empty.
+
+    GitHub stamps end in `Z`, which fromisoformat rejects before Python 3.11 and
+    the pipeline host runs 3.9. A stamp with no zone is read as UTC, because
+    every stamp this compares against is one GitHub wrote.
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    if raw[-1] in "Zz":
+        raw = raw[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(raw)
+    except ValueError:
+        die(2, "%s is not an ISO-8601 timestamp: %r" % (what, text))
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+def verdict_of(review):
+    """The verdict from the review body's opening line, and nowhere else.
+
+    A body whose first non-empty line carries none of the three marks is
+    `unknown`, which is not green — except for the one unverdicted body that has a
+    meaning of its own, the quota notice, which is `quota-exhausted`. Scanning
+    further down for a mark would let a finding that merely quotes 🟢 decide the
+    gate.
+    """
+    body = str(review.get("body") or "")
+    for line in body.splitlines():
+        if not line.strip():
+            continue
+        for mark, name in VERDICT_MARKS:
+            if mark in line:
+                return name
+        low = body.lower()
+        if all(phrase in low for phrase in QUOTA_PHRASES):
+            return "quota-exhausted"
+        return "unknown"
+    return "unknown"
+
+
+def note_quota(repo, pr):
+    print("pr-review-round: Copilot could not review %s#%d — the requester is out "
+          "of review quota, so the round did not happen. That is not a verdict "
+          "and not a green light: stop, and let a human decide whether to act on "
+          "the last substantive verdict or wait for quota." % (repo, pr),
+          file=sys.stderr)
+
+
+def note_unknown(review):
+    """Say what an unverdicted review actually opened with.
+
+    `unknown` is the right verdict for a body that carries no mark and is not the
+    quota notice — it is certainly not green — but the word alone tells a reader
+    nothing about what Copilot did say. Copilot posts more than verdicts through
+    this endpoint, and the opening line is usually the whole story.
+    """
+    print("pr-review-round: the latest Copilot review carries no verdict line. "
+          "It opens: %s" % first_line(review.get("body")), file=sys.stderr)
+
+
+def first_line(body):
+    text = str(body or "").replace("\r", "")
+    for line in text.splitlines():
+        if line.strip():
+            return line.strip()
+    return "(no body)"
+
+
+def copilot_reviews(repo, pr):
+    """Every submitted Copilot review on the PR, oldest first."""
+    reviews = gh_rest("repos/%s/pulls/%d/reviews" % (repo, pr), "the PR's reviews")
+    mine = [r for r in reviews
+            if is_copilot((r.get("user") or {}).get("login")) and r.get("submitted_at")]
+    mine.sort(key=lambda r: parse_ts(r["submitted_at"], "a review's submitted_at"))
+    return mine
+
+
+def pick_head_review(reviews, head, verdicts_only=False):
+    """The newest review in `reviews` that is OF `head`, or None.
+
+    The one question `request`, `wait` and `status` all ask — see the header.
+    Not "the newest review, if it happens to be of `head`": a stale review of an
+    older commit can be submitted after the one that matters, and picking the
+    newest first would hide the verdict actually being looked for.
+
+    `verdicts_only` additionally skips a quota notice, which is what `request`
+    needs. A notice arrives as a review like any other, carrying the head in
+    `commit_id`, but it reviewed nothing — on amarcu/agentic-pipeline#35 the only
+    review against head 44b68d8 was the notice, and reading it as "this commit
+    has been reviewed" would refuse the one request with something to find.
+    """
+    for review in reversed(reviews):
+        if review.get("commit_id") != head:
+            continue
+        if verdicts_only and verdict_of(review) == "quota-exhausted":
+            continue
+        return review
+    return None
+
+
+def head_review(repo, pr, head, verdicts_only=False):
+    """pick_head_review over a fresh read. For callers that need only the one."""
+    return pick_head_review(copilot_reviews(repo, pr), head, verdicts_only)
+
+
+def head_sha(repo, pr):
+    data = gh_json(["api", "repos/%s/pulls/%d" % (repo, pr)], "the PR's head SHA")
+    sha = (data.get("head") or {}).get("sha") if isinstance(data, dict) else None
+    if not sha:
+        die(2, "the PR payload for %s#%d carries no head.sha" % (repo, pr))
+    return sha
+
+
+def unanswered_comments(repo, pr):
+    """Every root review comment nobody has replied to.
+
+    A root has `in_reply_to_id == null`, and it is answered as soon as some
+    other comment's `in_reply_to_id` names it. The root's author is not
+    filtered: this decides whether the round is settled, not who raised what,
+    and a thread left hanging is left hanging whoever opened it.
+    """
+    comments = gh_rest("repos/%s/pulls/%d/comments" % (repo, pr),
+                       "the PR's review comments")
+    answered = {c.get("in_reply_to_id") for c in comments
+                if c.get("in_reply_to_id") is not None}
+    out = []
+    for c in comments:
+        if c.get("in_reply_to_id") is not None or c.get("id") in answered:
+            continue
+        out.append({
+            "id": c.get("id"),
+            "path": c.get("path") or "-",
+            "line": c.get("line") or c.get("original_line") or "-",
+            "author": (c.get("user") or {}).get("login") or "-",
+            "url": c.get("html_url") or "",
+            "first_line": first_line(c.get("body")),
+        })
+    return out
+
+
+def pending_request(repo, pr):
+    """True when Copilot already has a review request outstanding on this PR.
+
+    A second request while one is pending may be ignored, so `request` asks
+    this before it posts anything.
+    """
+    owner, _, name = repo.partition("/")
+    data = gh_json(["api", "graphql", "-f", "query=" + REQUESTS_QUERY,
+                    "-f", "owner=" + owner, "-f", "repo=" + name,
+                    "-F", "pr=%d" % pr], "the PR's pending review requests")
+    try:
+        nodes = data["data"]["repository"]["pullRequest"]["reviewRequests"]["nodes"]
+    except (KeyError, TypeError):
+        die(2, "the reviewRequests query answered nothing usable for %s#%d: %s"
+            % (repo, pr, json.dumps(data)[:300]))
+    for node in nodes or []:
+        reviewer = (node or {}).get("requestedReviewer") or {}
+        if reviewer.get("__typename") == "Bot" and is_copilot(reviewer.get("login")):
+            return True
+    return False
+
+
+def review_requested_count(repo, pr):
+    """How many times Copilot has been asked to review, per the PR timeline.
+
+    This number is the proof the POST did something. The `Copilot` reviewer
+    form returns success and leaves it exactly where it was.
+    """
+    events = gh_rest("repos/%s/issues/%d/timeline" % (repo, pr), "the PR's timeline")
+    return sum(1 for e in events
+               if e.get("event") == "review_requested"
+               and is_copilot((e.get("requested_reviewer") or {}).get("login")))
+
+
+def cmd_request(args):
+    repo, pr = args.repo, args.pr
+    if pending_request(repo, pr):
+        print("ROUND: %s#%d already-pending" % (repo, pr))
+        return 0
+
+    # Nothing new to review means nothing worth paying for — see QUOTA_PHRASES
+    # above for what a repeat request actually costs.
+    if not args.force:
+        head = head_sha(repo, pr)
+        if head_review(repo, pr, head, verdicts_only=True) is not None:
+            print("ROUND: %s#%d already-reviewed-at %s" % (repo, pr, head[:7]))
+            die(6, "Copilot has already reviewed %s at %s, and GitHub bills every "
+                   "review to the requester. Push a commit first, or pass --force "
+                   "to buy the same verdict twice." % (repo, head[:7]))
+
+    before = review_requested_count(repo, pr)
+    post = gh_attempt(["api", "-X", "POST",
+                       "repos/%s/pulls/%d/requested_reviewers" % (repo, pr),
+                       "-f", "reviewers[]=" + COPILOT_REVIEWER])
+    note = ("" if post.returncode == 0 else
+            "the POST exited %d: %s" % (post.returncode, post.stderr.strip()[:300]))
+
+    # The HTTP status is not evidence, so ask GitHub what actually changed. A
+    # request that is already gone by now — Copilot answering inside the round
+    # trip — still moved the timeline, which is why both checks count.
+    if pending_request(repo, pr) or review_requested_count(repo, pr) > before:
+        if note:
+            print("pr-review-round: %s — the request landed regardless" % note,
+                  file=sys.stderr)
+        print("ROUND: %s#%d requested" % (repo, pr))
+        return 0
+
+    die(3, "no review request was created on %s#%d — %s"
+        % (repo, pr, note or "the POST reported success, but no request is pending "
+                             "and the review_requested count did not move"))
+
+
+def cmd_wait(args):
+    repo, pr = args.repo, args.pr
+
+    # Default: this instant. The round is "a review submitted from now, of the
+    # commit that is head now", which a caller can express by running `wait`
+    # right after `request` — no clock, and so no `date` in any caller's
+    # allowed-tools. Passing `--since` explicitly is for a human reconstructing
+    # a round after the fact.
+    since = parse_ts(args.since, "--since") if args.since else datetime.now(timezone.utc)
+
+    # Read once, not per poll: `request` was issued against the head as it stood
+    # then, and that is the commit this round is about. A push that lands
+    # mid-wait is the next round's business.
+    head = head_sha(repo, pr)
+
+    # One check always happens before the first sleep, so `--timeout-mins 0`
+    # means "look once and report", not "do nothing".
+    deadline = time.monotonic() + args.timeout_mins * 60.0
+    while True:
+        review = head_review(repo, pr, head)
+        if review is not None:
+            at = parse_ts(review["submitted_at"], "the review's submitted_at")
+            if at > since:
+                verdict = verdict_of(review)
+                if verdict == "quota-exhausted":
+                    print("ROUND: %s#%d quota-exhausted" % (repo, pr))
+                    note_quota(repo, pr)
+                    return 5
+                if verdict == "unknown":
+                    note_unknown(review)
+                print("ROUND: %s#%d review %s %s"
+                      % (repo, pr, review["submitted_at"], verdict))
+                return 0
+        if time.monotonic() + args.poll_secs > deadline:
+            break
+        time.sleep(args.poll_secs)
+
+    print("ROUND: %s#%d timeout after %gm — no Copilot review of %s since %s"
+          % (repo, pr, args.timeout_mins, head[:7], since.isoformat()))
+    die(4, "waited %gm for a Copilot review of %s on %s#%d and none arrived. A "
+           "timeout is NOT a green light: this commit was not reviewed, so it was "
+           "not approved. A review of some other commit does not count."
+        % (args.timeout_mins, head[:7], repo, pr))
+
+
+def cmd_status(args):
+    repo, pr = args.repo, args.pr
+    head = head_sha(repo, pr)
+    # One read, so the "no review of the head" branch can name what there is
+    # instead without asking GitHub a second time.
+    reviews = copilot_reviews(repo, pr)
+    review = pick_head_review(reviews, head)
+    verdict = "no-review" if review is None else verdict_of(review)
+    unanswered = unanswered_comments(repo, pr)
+    green = verdict == "green" and not unanswered
+
+    if review is None and reviews:
+        # The shape this whole script exists to refuse. A 🟢 against the commit
+        # before this push is still a 🟢, and exit 0 here is the loop's signal to
+        # stop — so it would stop on a verdict about code nobody has reviewed.
+        print("pr-review-round: no Copilot review of %s, the head of %s#%d. The "
+              "newest verdict is against %s, and says nothing about what has been "
+              "pushed since." % (head[:7], repo, pr,
+                                 (reviews[-1].get("commit_id") or "?")[:7]),
+              file=sys.stderr)
+    elif review is None:
+        print("pr-review-round: %s#%d carries no Copilot review — `no-review` is "
+              "not an approval, it is the absence of one." % (repo, pr),
+              file=sys.stderr)
+    elif verdict == "quota-exhausted":
+        note_quota(repo, pr)
+    elif verdict == "unknown":
+        note_unknown(review)
+
+    if args.json:
+        print(json.dumps({
+            "repo": repo,
+            "pr": pr,
+            "head": head,
+            "verdict": verdict,
+            "green": green,
+            "review": None if review is None else {
+                "id": review.get("id"),
+                "state": review.get("state"),
+                "submitted_at": review.get("submitted_at"),
+                "commit_id": review.get("commit_id") or "",
+                "url": review.get("html_url") or "",
+            },
+            "unanswered_count": len(unanswered),
+            "unanswered": unanswered,
+        }, indent=2))
+    else:
+        print("ROUND: %s#%d status %s unanswered=%d"
+              % (repo, pr, verdict, len(unanswered)))
+        for c in unanswered:
+            print("%s %s:%s %s" % (c["id"], c["path"], c["line"], c["first_line"]))
+
+    if green:
+        return 0
+    # A distinct code for the one not-green outcome a caller must never retry.
+    return 5 if verdict == "quota-exhausted" else 1
+
+
+def add_target(parser):
+    parser.add_argument("repo", metavar="owner/repo")
+    parser.add_argument("pr", type=int, metavar="pr")
+
+
+def main():
+    ap = argparse.ArgumentParser(
+        prog="pr-review-round", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    subs = ap.add_subparsers(dest="cmd", required=True)
+
+    request = subs.add_parser("request", help="request a Copilot review")
+    add_target(request)
+    request.add_argument("--force", action="store_true",
+                         help="request even when this head SHA already has a verdict")
+
+    wait = subs.add_parser("wait", help="wait for a Copilot review to land")
+    add_target(wait)
+    wait.add_argument("--since", metavar="ISO8601",
+                      help="only a review submitted after this instant counts "
+                           "(default: the moment the wait starts)")
+    wait.add_argument("--timeout-mins", type=float, default=12.0,
+                      help="give up after this many minutes (default: 12)")
+    wait.add_argument("--poll-secs", type=float, default=60.0,
+                      help="seconds between checks (default: 60)")
+
+    status = subs.add_parser("status", help="verdict plus unanswered findings")
+    add_target(status)
+    status.add_argument("--json", action="store_true",
+                        help="emit the whole state as one JSON object")
+
+    args = ap.parse_args()
+
+    owner, sep, name = args.repo.partition("/")
+    if not (sep and owner and name) or "/" in name:
+        die(2, "expected <owner/repo>, got %r" % args.repo)
+    if args.pr < 1:
+        die(2, "expected a positive PR number, got %d" % args.pr)
+    if args.cmd == "wait":
+        if args.poll_secs <= 0:
+            die(2, "--poll-secs must be greater than zero")
+        if args.timeout_mins < 0:
+            die(2, "--timeout-mins cannot be negative")
+
+    return {"request": cmd_request, "wait": cmd_wait, "status": cmd_status}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

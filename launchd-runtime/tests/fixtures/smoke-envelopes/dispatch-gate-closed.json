@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":6,
+ "total_cost_usd":0.1902,"session_id":"smoke-fixture-gate-closed",
+ "permission_denials":[],
+ "result":"DISPATCH GATE: open_agent_prs=5 cap=5 per_repo=2 run_max=4 budget=0 blocked=1 at_limit=acme/GameTwo eligible=-\nHALT: dispatch-tasks gate-closed\nDISPATCH END: run=smoke-1757246400 dispatched=0 halted=1 refused=0",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":5,"outputTokens":301,
+  "cacheReadInputTokens":31500,"cacheCreationInputTokens":7400}}}

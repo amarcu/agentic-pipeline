@@ -1,0 +1,577 @@
+#!/usr/bin/python3
+"""agenda - everything waiting on the human, ordered by how much each item unblocks.
+
+Usage: agenda [--host <ssh-alias>] [--json]
+
+The read-only half of the `unstick` skill. By 2026-09-06 the automation worked
+and the human loop did not: proposals sat unapproved for days, host blockers
+surfaced only in digests, and one of seven active repos had ever had a
+direction session. The 19:00 daily-review-nudge reports the queue; this lists
+it for the sitting that drains it. It is a script and not prose for the reason
+triage-repo.sh is one: a model assembling a list by reasoning files the same
+item differently on two runs.
+
+Sections, and the predicate each item passes:
+
+  HOST       check-requirements reports missing, manifest-error or unresolved
+             for an active repo - on the pipeline host when --host is given
+  MERGE      an open PR that is not a draft, or a draft that is green:
+             `pr-review-round status` exits 0, or the newest cursor-review
+             marker in its reviews says verdict=pass for the current head.
+             `steps` is [ready, merge] for a draft and [merge] otherwise:
+             GitHub refuses to merge a draft, so marking it ready is a step
+             the human confirms first, never a retry after a refused merge
+  BLOCKED    an open issue carrying any `blocked:*` label
+  REVIEW     an open draft that is not green and is an agent's: on a
+             task/issue-<N>- or worktree-issue- branch, or carrying
+             work-on-task's attribution marker. Every PR posts under the
+             human's account, so those are the only tells; every other draft
+             is counted on one `more` line instead of listed. `steps` is []:
+             ready waits for a passed adversarial review, which is MERGE
+  APPROVE    an open issue labelled `proposed`, not `approved`, not blocked
+  DIRECTION  an active repo, not driven by another (its driver's drill covers
+             it), whose default branch has no agent/FOCUS.md, or whose
+             Decisions log has no entry within the rotation window.
+             Each is a plan-features session of about half an hour, so one is
+             listed - a driver repo (get_driver) first, then the most approved
+             or proposed issues, then REPOS_BY_PRIORITY - and the rest are
+             counted on a `more` line, one session per day. An open focus PR
+             named in the detail is a PR like any other: it takes its own
+             MERGE or REVIEW route, never a bare merge from DIRECTION
+
+The issue and PR sections cover ACTIVE_REPOS plus this repo, whose PRs only a
+human or Cursor may review (CLAUDE.md); HOST and DIRECTION cover ACTIVE_REPOS
+alone.
+
+Order: `unblocks` descending, then section in the order above, then oldest
+first. `unblocks` is 1 for every item except where fixing it frees queued
+issues - open, `approved`, and not claimed by an open PR:
+  - HOST counts them: nothing queued can be built until the host is fixed
+  - an agent PR in a repo at DISPATCH_PER_REPO_MAX adds them, because dispatch
+    skips that repo until one of its PRs clears. Here an agent PR is the one
+    repos.conf defines and dispatch counts: an agent branch or `Closes #<n>`
+
+Exit codes:
+  0  the agenda is complete, possibly empty
+  1  the agenda printed, but a query failed - each ERROR line names the repo
+  2  usage, or repos.conf could not be read
+
+Read-only: `gh issue list`, `gh pr list`, `gh api` GETs of one file,
+`pr-review-round status`, and `check-requirements` - locally, or over one ssh.
+No third-party modules and nothing past 3.9: /usr/bin/python3 is 3.9.6.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__)))))
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(
+    REPO_ROOT, "launchd-runtime", "repos.conf")
+CHECK_REQUIREMENTS = os.environ.get("CHECK_REQUIREMENTS") or os.path.join(
+    REPO_ROOT, "launchd-runtime", "bin", "check-requirements")
+PR_REVIEW_ROUND = os.environ.get("PR_REVIEW_ROUND") or os.path.join(
+    REPO_ROOT, "launchd-runtime", "bin", "pr-review-round")
+SSH = os.environ.get("SSH_BIN") or "/usr/bin/ssh"
+GH = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+
+PIPELINE_REPO = "amarcu/agentic-pipeline"
+
+# check-requirements resolves `cmd` against the PATH it inherits, so running it
+# under the routines' PATH is what makes its answer the routine's answer.
+ROUTINE_PATH = os.path.expanduser("~/.unity/bin") + ":" + os.path.expanduser("~/.local/bin") + (
+    ":/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin")
+# On the pipeline host the checkout is wherever install.sh linked _run.sh from,
+# so the remote shell resolves it there instead of this file naming a path.
+HOST_CHECKOUT = ('"$(/usr/bin/dirname "$(/usr/bin/readlink '
+                 '"${AGENTIC_SKILLS_HOME:-$HOME/.agentic-skills}/routines/_run.sh")")/../.."')
+REMOTE_PATH = "$HOME/.unity/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin"
+
+SECTIONS = ("HOST", "MERGE", "BLOCKED", "REVIEW", "APPROVE", "DIRECTION")
+RANK = dict((name, i) for i, name in enumerate(SECTIONS))
+
+# Minutes per item. APPROVE, REVIEW and MERGE are daily-review-nudge's figures
+# ("2 minutes per item to approve, 5 per draft to mark ready, 5 per PR to
+# merge"); HOST and BLOCKED are this skill's own, and DIRECTION is one
+# plan-features session.
+MINUTES = {"HOST": 2, "MERGE": 5, "BLOCKED": 5, "REVIEW": 5, "APPROVE": 2, "DIRECTION": 25}
+
+
+HOST_FAILURES = ("missing", "manifest-error", "unresolved")
+
+# repos.conf's definition of an agent PR, the one dispatch counts against its caps.
+AGENT_BRANCH_RE = re.compile(r"^(?:task/issue-|worktree-issue-)(\d+)")
+CLOSES_RE = re.compile(r"\bCloses #(\d+)", re.IGNORECASE)
+WORK_ON_TASK_MARKER = "<!-- agentic-skills: skill=work-on-task"
+CURSOR_MARKER_RE = re.compile(r"<!-- cursor-review (.*?) -->")
+DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b")
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+HOST_RE = re.compile(r"^[A-Za-z0-9_.@-]+$")
+
+GH_TIMEOUT = 120
+HOST_TIMEOUT = 300
+UNDATED = 10 ** 6   # sorts a never-set DIRECTION ahead of a merely stale one
+
+
+class QueryError(Exception):
+    pass
+
+
+def parse_time(text):
+    # fromisoformat and %z both refuse GitHub's `Z` suffix on 3.9.
+    return datetime.strptime(text[:19], "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def now_utc():
+    pinned = os.environ.get("AGENDA_NOW")
+    return parse_time(pinned) if pinned else datetime.now(timezone.utc)
+
+
+def first_line(text):
+    for line in (text or "").split("\n"):
+        if line.strip():
+            return line.strip()
+    return ""
+
+
+def run(argv, timeout, env=None):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        raise QueryError("%s timed out after %ds" % (os.path.basename(argv[0]), timeout))
+    except OSError as err:
+        raise QueryError("%s: %s" % (argv[0], err))
+
+
+def gh(args, allow_404=False):
+    """stdout of a read-only gh call; None for a 404 only when `allow_404`."""
+    proc = run([GH] + args, GH_TIMEOUT)
+    if proc.returncode == 0:
+        return proc.stdout
+    if allow_404 and "HTTP 404" in (proc.stderr or ""):
+        return None
+    raise QueryError("gh %s exit %d: %s" % (" ".join(args[:2]), proc.returncode,
+                                            first_line(proc.stderr) or "no output"))
+
+
+def gh_json(args):
+    try:
+        return json.loads(gh(args))
+    except ValueError:
+        raise QueryError("gh %s returned unreadable JSON" % " ".join(args[:2]))
+
+
+def read_conf():
+    """ACTIVE_REPOS, DISPATCH_PER_REPO_MAX, REPOS_BY_PRIORITY and every repo some
+    other repo's get_driver names, from repos.conf; None when it cannot be read."""
+    if not os.path.isfile(REPOS_CONF):
+        return None
+    proc = subprocess.run(
+        ["/bin/bash", "-c", '. "$1" >/dev/null 2>&1 || exit 3\n'
+         'printf "active %s\\n" "${ACTIVE_REPOS[@]}"\n'
+         'printf "per_repo_max %s\\n" "$DISPATCH_PER_REPO_MAX"\n'
+         'for r in "${REPOS_BY_PRIORITY[@]}" "${ACTIVE_REPOS[@]}"; do\n'
+         '    printf "priority %s\\n" "$r"\n'
+         '    d=$(get_driver "$r" 2>/dev/null); printf "driver %s\\n" "$d"\n'
+         '    if [ -n "$d" ]; then printf "driven %s\\n" "$r"; fi\n'
+         'done\n',
+         "agenda", REPOS_CONF], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    conf = {"active": [], "cap": None, "priority": [], "drivers": set(), "driven": set()}
+    for line in proc.stdout.split("\n"):
+        key, _, value = line.partition(" ")
+        value = value.strip()
+        if not value:
+            continue
+        if key == "active":
+            conf["active"].append(value)
+        elif key == "per_repo_max" and value.isdigit():
+            conf["cap"] = int(value)
+        elif key == "priority" and value not in conf["priority"]:
+            conf["priority"].append(value)
+        elif key == "driver":
+            conf["drivers"].add(value)
+        elif key == "driven":
+            conf["driven"].add(value)
+    return conf
+
+
+def make_item(section, repo, number, title, since, now, detail, url, unblocks=1):
+    return {"id": "%s:%s%s" % (section.lower(), repo, "#%d" % number if number else ""),
+            "section": section, "repo": repo, "number": number, "title": title,
+            "age_days": None if since is None else max(0, (now - since).days),
+            "unblocks": unblocks, "detail": detail, "url": url}
+
+
+def target(found):
+    return found["repo"] + ("#%d" % found["number"] if found["number"] else "")
+
+
+def cursor_pass(pr):
+    """The newest cursor-review marker about the PR's CURRENT head says pass.
+
+    A pass on the commit before the latest push says nothing about the push.
+    """
+    head = pr.get("headRefOid") or ""
+    newest = None
+    for review in pr.get("reviews") or []:
+        match = CURSOR_MARKER_RE.search(review.get("body") or "")
+        if not match:
+            continue
+        fields = dict(part.split("=", 1) for part in match.group(1).split() if "=" in part)
+        reviewed = fields.get("head") or ""
+        if not head or not reviewed or not (head.startswith(reviewed) or reviewed.startswith(head)):
+            continue
+        stamp = review.get("submittedAt") or ""
+        if newest is None or stamp >= newest[0]:
+            newest = (stamp, fields.get("verdict"))
+    return newest is not None and newest[1] == "pass"
+
+
+def round_green(repo, number):
+    try:
+        return run([PR_REVIEW_ROUND, "status", repo, str(number)], GH_TIMEOUT).returncode == 0
+    except QueryError:
+        return False
+
+
+def agent_draft(pr):
+    return bool(AGENT_BRANCH_RE.match(pr.get("headRefName") or "")) \
+        or WORK_ON_TASK_MARKER in (pr.get("body") or "")
+
+
+def gather_repo(repo, cap, now, active, use_round):
+    """One repo's issues and PRs, as a dict:
+    items   what the sitting walks
+    others  drafts that are not an agent's, counted on the REVIEW `more` line
+    queued  creation times of approved issues no open PR claims
+    work    open issues labelled approved or proposed
+    prs     the open PRs, for DIRECTION's focus-PR note
+    Raises QueryError."""
+    issues = gh_json(["issue", "list", "--repo", repo, "--state", "open", "--limit", "200",
+                      "--json", "number,title,labels,createdAt,url"])
+    prs = gh_json(["pr", "list", "--repo", repo, "--state", "open", "--limit", "100",
+                   "--json", "number,title,isDraft,headRefName,headRefOid,body,createdAt,url,reviews"])
+
+    claimed, cap_prs = set(), set()
+    for pr in prs:
+        refs = set(int(n) for n in CLOSES_RE.findall(pr.get("body") or ""))
+        branch = AGENT_BRANCH_RE.match(pr.get("headRefName") or "")
+        if branch:
+            refs.add(int(branch.group(1)))
+        if refs:
+            cap_prs.add(pr["number"])
+        claimed |= refs
+
+    result = {"items": [], "others": [], "queued": [], "work": 0, "prs": prs}
+    for issue in issues:
+        labels = set(label.get("name") or "" for label in issue.get("labels") or [])
+        since = parse_time(issue["createdAt"])
+        if labels & set(("approved", "proposed")):
+            result["work"] += 1
+        if "approved" in labels and issue["number"] not in claimed:
+            result["queued"].append(since)
+        blocked = sorted(name for name in labels if name.startswith("blocked:"))
+        if blocked:
+            result["items"].append(make_item("BLOCKED", repo, issue["number"], issue["title"],
+                                             since, now, ", ".join(blocked), issue["url"]))
+        elif "proposed" in labels and "approved" not in labels:
+            result["items"].append(make_item("APPROVE", repo, issue["number"], issue["title"],
+                                             since, now, "proposed, not approved", issue["url"]))
+
+    queued = result["queued"]
+    capped = active and cap is not None and len(cap_prs) >= cap
+    for pr in prs:
+        section, detail, steps = "MERGE", "not a draft; merge", ["merge"]
+        if pr.get("isDraft"):
+            green = ""
+            if cursor_pass(pr):
+                green = "cursor-review pass on its head"
+            elif use_round and round_green(repo, pr["number"]):
+                green = "pr-review-round green"
+            if green:
+                detail, steps = "draft, %s; mark ready, then merge" % green, ["ready", "merge"]
+            else:
+                section, detail, steps = "REVIEW", "agent draft", []
+        unblocks = 1
+        if capped and pr["number"] in cap_prs and queued:
+            unblocks += len(queued)
+            detail += "; repo at DISPATCH_PER_REPO_MAX with %d queued issue(s) behind it" % len(queued)
+        found = make_item(section, repo, pr["number"], pr["title"], parse_time(pr["createdAt"]),
+                          now, detail, pr["url"], unblocks)
+        found["steps"] = steps
+        if section == "REVIEW" and not agent_draft(pr):
+            result["others"].append(found)
+        else:
+            result["items"].append(found)
+    return result
+
+
+def newest_decision(text):
+    """The newest date written under `## Decisions log`, or None."""
+    newest, in_log = None, False
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            in_log = line[3:].strip().lower().startswith("decisions log")
+            continue
+        if not in_log:
+            continue
+        for stamp in DATE_RE.findall(line):
+            try:
+                day = datetime.strptime(stamp, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if newest is None or day > newest:
+                newest = day
+    return newest
+
+
+def direction_item(repo, prs, now, window):
+    text = gh(["api", "repos/%s/contents/agent/FOCUS.md" % repo,
+               "-H", "Accept: application/vnd.github.raw"], allow_404=True)
+    newest = None if text is None else newest_decision(text)
+    if newest is not None and (now.date() - newest).days < window:
+        return None
+    since = None
+    if text is None:
+        detail = "no agent/FOCUS.md"
+    elif newest is None:
+        detail = "agent/FOCUS.md has no dated Decisions-log entry"
+    else:
+        detail = "last Decisions-log entry %s" % newest.isoformat()
+        since = datetime(newest.year, newest.month, newest.day, tzinfo=timezone.utc)
+    focus = sorted(pr["number"] for pr in prs
+                   if (pr.get("headRefName") or "").startswith("docs/focus-"))
+    if focus:
+        detail += "; focus PR #%d is open" % focus[0]
+    return make_item("DIRECTION", repo, None, "", since, now, detail,
+                     "https://github.com/%s" % repo)
+
+
+def parse_results(stdout):
+    results = {}
+    for line in (stdout or "").split("\n"):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            data = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(data, dict) and data.get("repo"):
+            results[data["repo"]] = data
+    return results
+
+
+def host_checks(repos, host):
+    """(check-requirements results by repo, where they ran, notes)."""
+    notes = []
+    if host:
+        remote = ("export PATH=%s; cd %s && for r in %s; do "
+                  "launchd-runtime/bin/check-requirements \"$r\" --json; done"
+                  % (REMOTE_PATH, HOST_CHECKOUT, " ".join(repos)))
+        try:
+            proc = run([SSH, "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", host, remote],
+                       HOST_TIMEOUT)
+            results = parse_results(proc.stdout)
+            why = "ssh exit %d: %s" % (proc.returncode, first_line(proc.stderr) or "no result")
+        except QueryError as err:
+            results, why = {}, str(err)
+        if results:
+            for repo in repos:
+                if repo not in results:
+                    notes.append("host %s returned no check-requirements result for %s" % (host, repo))
+            return results, host, notes
+        notes.append("host %s gave no answer (%s); HOST was checked on this machine instead"
+                     % (host, why))
+    if not os.access(CHECK_REQUIREMENTS, os.X_OK):
+        notes.append("check-requirements not found at %s; HOST was not checked" % CHECK_REQUIREMENTS)
+        return {}, "none", notes
+    env = dict(os.environ, PATH=ROUTINE_PATH)
+    results = {}
+    for repo in repos:
+        try:
+            results.update(parse_results(run([CHECK_REQUIREMENTS, repo, "--json"],
+                                             HOST_TIMEOUT, env).stdout))
+        except QueryError as err:
+            notes.append("check-requirements %s: %s" % (repo, err))
+    return results, "local", notes
+
+
+def host_item(result, queued, now):
+    status = result.get("status")
+    if status not in HOST_FAILURES:
+        return None
+    if status == "missing":
+        detail = "missing: " + ", ".join(result.get("missing") or [])
+        if result.get("below_floor"):
+            detail += " (below floor: %s)" % ", ".join(result["below_floor"])
+    else:
+        detail = "%s: %s" % (status, "; ".join(result.get("errors") or []))
+    if result.get("source") == "template":
+        detail += " (template)"
+    detail += "; sitting on %d approved issue(s)" % len(queued)
+    found = make_item("HOST", result["repo"], None, "", min(queued) if queued else None, now,
+                      detail, "", unblocks=len(queued))
+    found["hints"] = [req.get("hint") or req.get("install")
+                      for req in result.get("requirements") or []
+                      if req.get("status") == "missing" and (req.get("hint") or req.get("install"))]
+    return found
+
+
+def pick_direction(candidates, conf, work):
+    """(the one DIRECTION item to list, the rest in the order they would follow)."""
+    def value(found):
+        repo = found["repo"]
+        rank = conf["priority"].index(repo) if repo in conf["priority"] else len(conf["priority"])
+        return (repo not in conf["drivers"], -work.get(repo, 0), rank, repo)
+    ranked = sorted(candidates, key=value)
+    chosen = ranked[0]
+    why = ["driver repo"] if chosen["repo"] in conf["drivers"] else []
+    why.append("%d approved or proposed issue(s)" % work.get(chosen["repo"], 0))
+    chosen["detail"] += "; " + ", ".join(why)
+    return chosen, ranked[1:]
+
+
+def sort_key(found):
+    age = UNDATED if found["age_days"] is None else found["age_days"]
+    return (-found["unblocks"], RANK[found["section"]], -age, found["repo"], found["number"] or 0)
+
+
+def more_lines(other_drafts, other_directions):
+    """The sections' unlisted remainder: one line each, with every target."""
+    more = []
+    if other_drafts:
+        n = len(other_drafts)
+        more.append({"section": "REVIEW", "count": n, "ids": [f["id"] for f in other_drafts],
+                     "line": "REVIEW +%d other draft%s (bootstrap/pipeline PRs): %s" % (
+                         n, "" if n == 1 else "s", ", ".join(target(f) for f in other_drafts))})
+    if other_directions:
+        n = len(other_directions)
+        more.append({"section": "DIRECTION", "count": n, "ids": [f["id"] for f in other_directions],
+                     "line": "DIRECTION +%d more repo%s a direction session (one per day): %s" % (
+                         n, " needs" if n == 1 else "s need",
+                         ", ".join(f["repo"] for f in other_directions))})
+    return more
+
+
+def estimate(items):
+    total = sum(MINUTES[found["section"]] for found in items)
+    return max(5, (total + 2) // 5 * 5) if items else 0
+
+
+def print_text(items, more, counts, minutes, where, notes, errors):
+    extra = dict((m["section"], m["count"]) for m in more)
+    if items or more:
+        print("AGENDA: %d items | %s | about %d min | host check: %s" % (
+            len(items), ", ".join("%s %d%s" % (name, counts[name],
+                                              " (+%d)" % extra[name] if name in extra else "")
+                                  for name in SECTIONS),
+            minutes, where))
+    else:
+        print("AGENDA: 0 items | nothing is waiting on you | host check: %s" % where)
+    for note in notes:
+        print("NOTE: " + note)
+    for error in errors:
+        print("ERROR: " + error)
+    for i, found in enumerate(items, 1):
+        age = "-" if found["age_days"] is None else "%dd" % found["age_days"]
+        title = found["title"] if len(found["title"]) <= 60 else found["title"][:57] + "..."
+        print("%3d. %-9s %-34s unblocks=%-2d age=%-4s %s%s  [%s]" % (
+            i, found["section"], target(found), found["unblocks"], age, found["detail"],
+            " | " + title if title else "", found["id"]))
+    for m in more:
+        print(m["line"])
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="agenda", description="Everything waiting on the human, ordered by what it unblocks.")
+    parser.add_argument("--host", metavar="SSH_ALIAS",
+                        help="run check-requirements on this pipeline host over ssh")
+    parser.add_argument("--json", action="store_true",
+                        help="one JSON document instead of the numbered agenda")
+    args = parser.parse_args()
+
+    if args.host is not None and not HOST_RE.match(args.host):
+        print("agenda: '%s' is not an ssh alias" % args.host, file=sys.stderr)
+        return 2
+    conf = read_conf()
+    if conf is None:
+        print("agenda: cannot read repos.conf at %s" % REPOS_CONF, file=sys.stderr)
+        return 2
+    active = conf["active"]
+    malformed = [repo for repo in active if not REPO_RE.match(repo)]
+    if not active or malformed:
+        print("agenda: ACTIVE_REPOS in %s is %s" % (
+            REPOS_CONF, "malformed: " + ", ".join(malformed) if malformed else "empty"),
+            file=sys.stderr)
+        return 2
+
+    now = now_utc()
+    notes, errors, items, other_drafts = [], [], [], []
+    use_round = os.access(PR_REVIEW_ROUND, os.X_OK)
+    if not use_round:
+        notes.append("pr-review-round not found at %s; a draft is green only on a "
+                     "cursor-review pass" % PR_REVIEW_ROUND)
+
+    queued_by_repo, prs_by_repo, work_by_repo = {}, {}, {}
+    for repo in active + ([] if PIPELINE_REPO in active else [PIPELINE_REPO]):
+        try:
+            found = gather_repo(repo, conf["cap"], now, repo in active, use_round)
+        except QueryError as err:
+            errors.append("%s: %s" % (repo, err))
+            continue
+        items.extend(found["items"])
+        other_drafts.extend(found["others"])
+        queued_by_repo[repo], prs_by_repo[repo] = found["queued"], found["prs"]
+        work_by_repo[repo] = found["work"]
+
+    results, where, host_notes = host_checks(active, args.host)
+    notes.extend(host_notes)
+    directions = []
+    # One drill a day, and a repo just drilled waits one day per drilled repo:
+    # whatever the pick order, every repo comes round within that many days.
+    drilled = [repo for repo in active if repo not in conf["driven"]]
+    window = max(1, len(drilled))
+    for repo in active:
+        if repo in results:
+            found = host_item(results[repo], queued_by_repo.get(repo, []), now)
+            if found:
+                items.append(found)
+        if repo in conf["driven"]:
+            continue
+        try:
+            found = direction_item(repo, prs_by_repo.get(repo, []), now, window)
+        except QueryError as err:
+            errors.append("%s: %s" % (repo, err))
+            continue
+        if found:
+            directions.append(found)
+
+    other_directions = []
+    if directions:
+        chosen, other_directions = pick_direction(directions, conf, work_by_repo)
+        items.append(chosen)
+
+    items.sort(key=sort_key)
+    other_drafts.sort(key=sort_key)
+    more = more_lines(other_drafts, other_directions)
+    counts = dict((name, sum(1 for found in items if found["section"] == name)) for name in SECTIONS)
+    minutes = estimate(items)
+    if args.json:
+        print(json.dumps({"generated": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "host_check": where,
+                          "counts": counts, "minutes": minutes, "notes": notes,
+                          "errors": errors, "items": items, "more": more}, indent=2))
+    else:
+        print_text(items, more, counts, minutes, where, notes, errors)
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

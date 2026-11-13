@@ -1,0 +1,319 @@
+# Tracked repositories and every cap in the pipeline.
+#
+# THIS FILE IS THE EXAMPLE. Copy it to `repos.conf` beside it and edit the copy:
+# `repos.conf` is git-ignored, because the roster and the checkout paths are one
+# owner's. The caps below are the defaults the pipeline was tuned with. The
+# rosters name one real pilot (StarBonk) and neutral stand-ins (acme/...), which
+# is what the test suite reads.
+#
+# Single source of truth: skills source it, scripts read it, nothing restates it.
+#
+# Format: bash arrays. Source this file with `. repos.conf`.
+
+# Workspace: StarBonk — the pilot: a Unity game and its backend
+WORKSPACE_STARBONK=(
+    "amarcu/StarBonk"
+    "amarcu/StarBonk-backend"
+)
+
+# Workspace: GameTwo — a second game: the game, its engine and a toolkit
+WORKSPACE_GAMETWO=(
+    "acme/GameTwo"
+    "acme/engine-toolkit"
+    "acme/game-engine"
+)
+
+# Workspace: Agent Lab — a product in two repos. Note that the
+# on-disk directory names are CROSSED relative to the GitHub names (see
+# get_repo_path below) — always resolve paths through that function.
+WORKSPACE_AGENT_LAB=(
+    "acme/agent-lab"
+    "acme/agent-lab-platform"
+)
+
+# Workspace: Strategy Game — a small game project.
+WORKSPACE_STRATEGY=(
+    "acme/strategy-game"
+)
+
+# Workspace: Video App — a research project.
+WORKSPACE_VIDEO=(
+    "acme/video_app"
+)
+
+# Workspace: Personal Sites — small sites and apps
+WORKSPACE_PERSONAL=(
+    "acme/portfolio-site"
+    "acme/club-site"
+    "acme/club_app"
+    "acme/notes"
+)
+
+# All workspaces, scan order. Format: "DisplayName:VAR_NAME"
+WORKSPACES=(
+    "StarBonk:WORKSPACE_STARBONK"
+    "GameTwo:WORKSPACE_GAMETWO"
+    "Agent Lab:WORKSPACE_AGENT_LAB"
+    "Strategy Game:WORKSPACE_STRATEGY"
+    "Video App:WORKSPACE_VIDEO"
+    "Personal Sites:WORKSPACE_PERSONAL"
+)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Stale threshold per workspace — days without activity before an item is
+# reported as stale. bash 3.2 case, for the same reason get_repo_path is one.
+#
+# Accepts either a workspace display name from WORKSPACES or an owner/repo, so
+# a caller holding only one of the two never has to map between them.
+#
+# 14 days is the default. Personal Sites is the single exception: those repos
+# are low-churn by design, and at 14 days the morning digest reported all four
+# of them as stale every single morning — which is how a digest teaches its
+# reader to skim past it. The number lives here and not in a skill because
+# morning-triage and triage-repo would otherwise each carry their own copy.
+#
+# Usage:
+#     . /path/to/repos.conf
+#     days=$(get_stale_days "acme/club_app")   # -> 30
+# ─────────────────────────────────────────────────────────────────────────
+get_stale_days() {
+    case "$1" in
+        "Personal Sites") echo 30 ;;
+        acme/portfolio-site|acme/club-site|acme/club_app|acme/notes)
+                          echo 30 ;;
+        *)                echo 14 ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Active roster + work-in-progress caps.
+#
+# ACTIVE_REPOS is the short list that gets nightly proposals, nightly
+# dispatch, and the daily review nudge. Every other repo in this file stays
+# tracked — it still appears in issues-status and the digests — but nothing
+# is generated for it. Moving a repo in or out of this list is the main lever
+# for controlling how much work the pipeline creates.
+#
+# The caps exist because the measured bottleneck is review, not proposal or
+# execution: across 57 agent PRs, merge outcome was explained entirely by
+# whether a review session happened that week. A queue that cannot be drained
+# in one 30-60 minute sitting is a queue that does not get drained at all.
+# ─────────────────────────────────────────────────────────────────────────
+# 2026-10-13: StarBonk is the only active repo, as a pilot (owner decision): every routine works on
+# it alone, with Claude owning delivery. The others are paused, not dropped; to bring one back, move
+# its line back up into the list.
+ACTIVE_REPOS=(
+    "amarcu/StarBonk"
+)
+# Paused for the StarBonk pilot:
+#   "amarcu/StarBonk-backend"
+#   "acme/GameTwo"
+#   "acme/agent-lab"
+#   "acme/agent-lab-platform"
+#   "acme/strategy-game"
+#   "acme/video_app"
+
+# The maximum number of OPEN AGENT PRs across ACTIVE_REPOS. An agent PR is an
+# open PR whose head branch starts with `task/issue-` or `worktree-issue-`, or
+# whose body contains `Closes #<n>`. Nothing else counts: approved-but-
+# unstarted issues are the queue this cap admits, and counting them here made
+# the queue block the only gate that can drain it (on 2026-09-02, 2 open PRs
+# plus 7 approved issues read as 9 against a cap of 6 and dispatched nothing).
+# This is the number of PRs that has to fit in one review sitting; it becomes
+# 8 once auto-ready removes the mark-ready column from that sitting.
+#
+# Since DISPATCH_PER_REPO_MAX arrived, this ceiling bounds the human's TOTAL
+# review load and nothing else. No single repo can reach it alone any more, so
+# it has stopped doubling as the brake on one runaway repo, and raising it is
+# now a separate decision from widening any one repo's share: it says "I can
+# review more PRs in one sitting", never "let repo X have more of them".
+DISPATCH_TOTAL_MAX=5
+
+# The maximum number of open agent PRs in ONE active repo, counted exactly as
+# DISPATCH_TOTAL_MAX counts them. A repo at this limit is skipped for the rest
+# of the run and blocks only itself; every other repo keeps dispatching. This
+# is the fix for the weakest-link gate: before it, a single repo whose PRs sat
+# unreviewed consumed the global ceiling and stalled all seven active repos
+# with it, so the pipeline moved at the speed of its most-neglected project.
+DISPATCH_PER_REPO_MAX=4
+
+# The maximum number of NEW dispatches in one run, whatever the two caps above
+# leave free. It bounds a single night's batch — four PRs landing at once is
+# already more than a morning's reading — and it is a rate limit, not a state
+# cap: it counts what this run opens, never what is already open.
+DISPATCH_RUN_MAX=4
+
+# The maximum number of unapproved `proposed` issues across ACTIVE_REPOS —
+# open issues labelled `proposed` that do not also carry `approved`. At or
+# above this number morning-proposals stops proposing, because the human's
+# approval queue is already full and more proposals only age in place.
+PROPOSED_BACKLOG_MAX=6
+
+# The merge lane (bin/merge-lane): the ONLY path by which an agent PR merges without the owner,
+# approved for StarBonk on 2026-10-13. It is a script, not a model: it merges only when Grok passed
+# the exact head, unity-gate passes with no fewer tests than the last merge, and every changed file
+# is code, tests or a design doc. A repo not listed here is never merged by anything but the owner.
+MERGE_LANE_REPOS=(
+    "amarcu/StarBonk"
+)
+# Merges per run, so a bad night lands at most this many changes before the owner looks.
+MERGE_LANE_MAX_PER_RUN=3
+
+# Playtest builds (bin/playtest-build, Monday, Wednesday and Friday at 09:00): the repo's own
+# Tools/build.sh makes a Mac and a Windows build of main, published as a pre-release on the repo's
+# GitHub releases and sent to the owner on Telegram. Asked for by the owner on 2026-10-17.
+PLAYTEST_BUILD_REPOS=(
+    "amarcu/StarBonk"
+)
+
+# Review rounds per pull request, and how many NEW findings each round may
+# raise. The per-round budget is zero at the last round: a finding first raised
+# there gets no worker attempt before the cap fires, so it is pure spend.
+# REVIEW_FINDINGS_MAX is the ceiling across every round of one PR — reaching it
+# means the PR is too large to review incrementally, and review-pr escalates
+# with reason `resplit` rather than opening an eighth thread.
+REVIEW_ROUND_MAX=3
+REVIEW_NEW_FINDINGS_BY_ROUND=(5 2 0)
+REVIEW_FINDINGS_MAX=7
+
+# Art and effects skills. A review past ART_FINDINGS_MAX says how many findings were cut and under
+# which rule they clustered; a VFX loop stops at VFX_ITERATIONS_MAX with a best-effort note rather
+# than a seventh iteration that overshoots the brief.
+ART_FINDINGS_MAX=5
+VFX_ITERATIONS_MAX=6
+
+# Usage: is_active_repo "amarcu/StarBonk" && echo yes
+is_active_repo() {
+    local candidate="$1" r
+    for r in "${ACTIVE_REPOS[@]}"; do
+        [ "$r" = "$candidate" ] && return 0
+    done
+    return 1
+}
+
+# Dispatch priority order — first repo gets attention first.
+# Single source of truth consumed by dispatch-tasks (the skill no longer
+# hardcodes this list).
+# Active repos come first, in the order they should get attention. Dormant
+# repos stay listed so issues-status and the digests still see them, but
+# dispatch and propose skip anything not in ACTIVE_REPOS.
+REPOS_BY_PRIORITY=(
+    "amarcu/StarBonk"
+    "amarcu/StarBonk-backend"
+    "acme/agent-lab"
+    "acme/agent-lab-platform"
+    "acme/GameTwo"
+    "acme/video_app"
+    "acme/strategy-game"
+    "acme/club-site"
+    "acme/engine-toolkit"
+    "acme/game-engine"
+    "acme/portfolio-site"
+    "acme/club_app"
+    "acme/notes"
+)
+
+# ─────────────────────────────────────────────────────────────────────────
+# Repo → on-disk path lookup (bash 3.2 compatible — macOS default).
+#
+# Why a function and not an associative array: macOS ships with bash 3.2,
+# which doesn't support `declare -A`. A case-based function works in any
+# POSIX-ish shell.
+#
+# Used by work-on-task and other skills to skip filesystem scans (`find`)
+# that previously orphaned for hours when scanning ~/. If a repo isn't in
+# this map, the skill MUST refuse to dispatch and surface a clear error,
+# rather than scanning. Keeping this list authoritative is the contract.
+#
+# Usage:
+#     . /path/to/repos.conf
+#     path=$(get_repo_path "acme/club-site")
+#     [ -z "$path" ] && { echo "unknown repo"; exit 2; }
+# ─────────────────────────────────────────────────────────────────────────
+get_repo_path() {
+    case "$1" in
+        amarcu/StarBonk)         echo "$HOME/code/StarBonk" ;;
+        amarcu/StarBonk-backend) echo "$HOME/code/StarBonk/backend" ;;
+        acme/GameTwo)       echo "$HOME/code/GameTwo" ;;
+        # CROSSED NAMES — the GitHub repo `agent-lab` is
+        # checked out in the directory `agent-lab-client`,
+        # and the GitHub repo `agent-lab-platform` is checked out in the
+        # directory `agent-lab`. Do not "fix" these by pattern.
+        acme/agent-lab)      echo "$HOME/code/agent-lab-client" ;;
+        acme/agent-lab-platform) echo "$HOME/code/agent-lab" ;;
+        acme/strategy-game)     echo "$HOME/code/strategy-game" ;;
+        acme/video_app)  echo "$HOME/code/video_app" ;;
+        acme/engine-toolkit)       echo "$HOME/code/engine-toolkit" ;;
+        acme/game-engine)           echo "$HOME/code/game-engine" ;;
+        acme/portfolio-site)       echo "$HOME/code/portfolio-site" ;;
+        acme/club-site)     echo "$HOME/code/club-site" ;;
+        acme/club_app)       echo "$HOME/code/club_app" ;;
+        acme/notes)         echo "$HOME/code/personal" ;;
+        # This repo. Present so tooling that takes an owner/repo — check-
+        # requirements, `make doctor-agentic-pipeline` — can resolve it; it is
+        # deliberately absent from ACTIVE_REPOS and every workspace array, so
+        # nothing dispatches, proposes or triages against it.
+        amarcu/agentic-pipeline)   (cd "$(/usr/bin/dirname "${BASH_SOURCE[0]}")/.." && pwd -P) ;;
+        *)                       echo "" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# Driver → driven relation.
+#
+# Some repos exist to serve another. A DRIVEN repo gets feature work only
+# when its DRIVER actually needs it; otherwise it gets health and stability
+# work (tests, chores, reliability), and that work ranks below the driver's
+# own features.
+#
+# `plan-features` reads this: in a driven repo an issue may be shaped as a
+# feature only if it cites the driver need it serves (a `DRIVEN BY` line);
+# everything else is a chore. In a driver repo, a feature that needs a
+# change downstream cuts the driven repo's issue in the same session and
+# links the two.
+#
+# Returns the driver's owner/repo, or empty when the repo drives itself.
+# Only pairs the human has stated belong here — never inferred from
+# directory layout or dependency graphs.
+#
+# Usage:
+#     . /path/to/repos.conf
+#     driver=$(get_driver "acme/game-engine")   # -> acme/GameTwo
+# ─────────────────────────────────────────────────────────────────────────
+get_driver() {
+    case "$1" in
+        # game → engine
+        acme/game-engine)               echo "acme/GameTwo" ;;
+        # game → framework
+        acme/engine-toolkit)           echo "acme/GameTwo" ;;
+        # game → backend
+        amarcu/StarBonk-backend)     echo "amarcu/StarBonk" ;;
+        # platform → generated client repo
+        acme/agent-lab)          echo "acme/agent-lab-platform" ;;
+        *)                           echo "" ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────
+# The branch agent work is based on and targets: the override below, else the
+# repo's GitHub default branch. Every skill that picks a base asks this one
+# function, so an issue a skill files carries the same base a worker uses.
+#
+# GameTwo ships from `live-dev`; its GitHub default `main` is a line that
+# diverged, so work based on main never shipped. An issue's `BASE BRANCH:` line still wins
+# over this, and `--from-branch` over both.
+#
+# Usage:
+#     . /path/to/repos.conf
+#     base=$(get_repo_base "acme/GameTwo")   # -> live-dev
+# ─────────────────────────────────────────────────────────────────────────
+get_repo_base() {
+    case "$1" in
+        acme/GameTwo)           echo "live-dev" ;;
+        *)
+            local gh
+            gh=$(command -v gh || echo "$HOME/.local/bin/gh")
+            "$gh" repo view "$1" --json defaultBranchRef -q .defaultBranchRef.name 2>/dev/null
+            ;;
+    esac
+}

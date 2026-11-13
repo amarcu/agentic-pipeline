@@ -1,0 +1,20 @@
+# What stays out of a published snapshot. `git archive` leaves these paths out,
+# and tools/export-public.sh builds the public tree from `git archive` alone,
+# so nothing that is not tracked (a .env, a worktree) can reach it either.
+#
+# anchor/ drives a session from a phone over a home network. Its tracked
+# configs are what it deploys from, so they name real hosts.
+anchor/                                                        export-ignore
+# The audit's evidence file quotes issue titles and message text from
+# private repositories. The audit itself is published.
+docs/assessments/2026-09-13-week-37-pipeline-audit.data.json  export-ignore
+# One project's real art bible. A fictional worked example ships in its place.
+skills/art-director/references/art-bible-starbonk.md           export-ignore
+# This skill ships a verbatim copy of a third party's rules page, with no
+# licence stated for it. It is used privately and left out of snapshots,
+# with the fixtures and the test that exist only for it.
+skills/setup-solana-mcp/                                       export-ignore
+launchd-runtime/tests/fixtures/solana-mcp/                     export-ignore
+launchd-runtime/tests/unit/test_check_upstream.sh              export-ignore
+# One project's notes for the visual-effects skill.
+skills/vfx-specialist/references/project-notes-starbonk.md     export-ignore

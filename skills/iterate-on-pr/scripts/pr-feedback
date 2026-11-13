@@ -1,0 +1,346 @@
+#!/usr/bin/python3
+"""pr-feedback — the review feedback on one pull request, one JSON object per line.
+
+Read-only: it writes nothing to GitHub and nothing to disk. iterate-on-pr Step 3
+runs it and acts on the objects whose `skip` is empty.
+
+Authorship classifies nothing here. The human, `review-pr` and the worker all
+post under the same GitHub login, so `user.type == "Bot"` is the only thing
+authorship settles and every other distinction has to come from a marker in the
+body:
+
+  <!-- finding:<id> severity:<s> round:<K> -->   either review lane, on an inline thread
+  <!-- <lane> repo=… pr=… round=… -->             a review lane, on its summary body
+  <!-- reply ... -->                              this worker's own reply
+  <!-- agentic-skills: skill=iterate-on-pr ... -->  this worker's own summary
+
+An item is skipped when the last thing said on it is the worker's own reply, or
+when everything said on it predates the worker's newest summary comment. Those
+two rules are what stop a second run re-acting on every thread the first one
+already answered; the reply marker is the durable half, because GitHub thread
+resolution is deny-listed for scheduled runs.
+
+Both rules identify the worker's writing by its marker, never by the login and
+never by the `Addressed in <sha>` opening. That prefix is a contract with
+daily-summary, not a signature: the human writes under the same login, so a
+human comment that happens to start with those words would otherwise drag the
+cut-off forward and retire every thread older than it.
+
+Emitted per line:
+  source               thread | comment | review
+  kind                 human | reviewer | bot
+  lane                 which reviewer produced it: review-pr | cursor-review |
+                       null for human and bot items
+  id                   the id to reply to: the thread's first review comment,
+                       the issue comment, or the review
+  thread_id            GraphQL node id (threads only), else null
+  finding              finding id from the tag, when there is one
+  path, line           at the head SHA (threads only), else null
+  last_author          login of the newest comment
+  newest_non_agent_at  timestamp of the newest comment the worker did not write
+  skip                 "" when actionable, else the reason
+  url, body            the item's URL, and every non-worker comment joined
+
+Usage: pr-feedback <owner/repo> <pr-number>
+Exits 0 when it printed the feedback (including none), 2 on a gh failure,
+3 when the PR carries more threads or comments than the caps below.
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+
+# A PR past this is not iterable in one pass, and truncating the query — which
+# is what `reviewThreads(first: 50)` did silently until 2026-09-03 — hides the
+# threads a reviewer cared most about. Halt instead, and let a human split it.
+MAX_THREADS = 50
+MAX_THREAD_COMMENTS = 100
+
+FINDING_RE = re.compile(r"<!--\s*finding:(\S+)\s+severity:(\S+)\s+round:(\d+)\s*-->")
+
+# Every review lane signs its summary body the same way — `<!-- <lane> repo=…
+# pr=… round=… head=… verdict=… -->` — so one pattern reads all of them and a
+# third lane needs no edit here. It used to be the literal string
+# "<!-- review-pr ", which meant `cursor-review`'s summary (PR #37) fell through
+# to `human`: a machine verdict routed to the path where a worker asks a
+# clarifying question or parks the item as ambiguous, and waits for an answer
+# that is never coming. The lane name is captured, not just matched, because a
+# worker adjudicating a finding should know which reviewer it is answering.
+#
+# The worker's own summary marker cannot match: it is `<!-- agentic-skills:
+# skill=… repo=… -->`, and the `:` after the name is where this pattern stops.
+REVIEW_SUMMARY_RE = re.compile(r"<!--\s*([a-z][a-z0-9-]*)\s+repo=\S+\s+pr=\S+\s+round=\S+")
+REPLY_MARKER = "<!-- reply "
+OWN_SUMMARY_MARKER = "<!-- agentic-skills: skill=iterate-on-pr"
+
+THREADS_QUERY = """
+query($owner: String!, $repo: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line originalLine
+          comments(first: 100) {
+            totalCount
+            nodes {
+              databaseId url body createdAt
+              author { login __typename }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+GH = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+
+
+def die(code, msg):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def gh_run(args):
+    out = subprocess.run([GH, *args], capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        die(2, "pr-feedback: gh %s: %s" % (" ".join(args), out.stderr.strip()[:200]))
+    return out.stdout
+
+
+def gh_rest(path):
+    """One paginated read-only call. --slurp separates pages structurally, so a
+    body containing '][' cannot be mistaken for a page boundary."""
+    text = gh_run(["api", "--paginate", "--slurp", path]).strip()
+    if not text:
+        return []
+    pages = json.loads(text)
+    return [item for page in pages for item in page]
+
+
+def gh_graphql(owner, name, pr, cursor):
+    # -f keeps a value a string; -F types it, which is what $pr: Int! needs and
+    # what a base64 cursor must not get.
+    args = ["api", "graphql", "-f", "query=" + THREADS_QUERY,
+            "-f", "owner=" + owner, "-f", "repo=" + name, "-F", "pr=%d" % pr]
+    if cursor:
+        args += ["-f", "cursor=" + cursor]
+    return json.loads(gh_run(args))
+
+
+def comment(login, is_bot, at, body, url, ident):
+    return {"author": login or "", "bot": bool(is_bot), "at": at or "",
+            "body": body or "", "url": url or "", "id": ident}
+
+
+def fetch_threads(owner, name, pr):
+    """Every review thread, paged to exhaustion — hasNextPage, not a first: N
+    guess. Over MAX_THREADS is a halt, so nothing is dropped unannounced."""
+    threads, cursor = [], None
+    while True:
+        page = gh_graphql(owner, name, pr, cursor)
+        block = page["data"]["repository"]["pullRequest"]["reviewThreads"]
+        threads.extend(block["nodes"])
+        if len(threads) > MAX_THREADS:
+            die(3, "pr-feedback: %s/%s#%d has more than %d review threads"
+                % (owner, name, pr, MAX_THREADS))
+        if not block["pageInfo"]["hasNextPage"]:
+            return threads
+        cursor = block["pageInfo"]["endCursor"]
+
+
+def is_worker_reply(c, agent):
+    return c["author"] == agent and REPLY_MARKER in c["body"]
+
+
+def summary_lane(body):
+    """The lane that signed `body` as a review summary, or None."""
+    m = REVIEW_SUMMARY_RE.search(body or "")
+    return m.group(1) if m else None
+
+
+def review_lane(comments):
+    """The lane whose summary marker appears in these comments, or None."""
+    for c in comments:
+        lane = summary_lane(c["body"])
+        if lane:
+            return lane
+    return None
+
+
+def is_own_summary(body, login, agent):
+    """One predicate for both readers of this: the `own-summary` skip reason and
+    the cut-off below. The marker is the whole test — see the module docstring."""
+    return login == agent and OWN_SUMMARY_MARKER in body
+
+
+def classify(comments, source, flags, agent, last_summary_at):
+    """kind and skip for one item, from its comments alone."""
+    finding = None
+    for c in comments:
+        m = FINDING_RE.search(c["body"])
+        if m:
+            finding = m.group(1)
+            break
+
+    lane = review_lane(comments)
+    if comments and comments[0]["bot"]:
+        kind = "bot"
+    elif finding or lane:
+        kind = "reviewer"
+    else:
+        kind = "human"
+
+    theirs = [c for c in comments if not is_worker_reply(c, agent)]
+    newest = max((c["at"] for c in theirs), default="")
+
+    if kind == "bot":
+        skip = "bot"
+    elif "resolved" in flags:
+        skip = "resolved"
+    elif "outdated" in flags:
+        skip = "outdated"
+    elif any(is_own_summary(c["body"], c["author"], agent) for c in comments):
+        skip = "own-summary"
+    elif comments and is_worker_reply(comments[-1], agent):
+        skip = "answered"
+    elif not theirs:
+        skip = "answered"
+    elif source == "review" and kind == "reviewer":
+        # review-pr's own summary body. Its findings arrive as threads; the
+        # summary is context for them, not a separate thing to fix.
+        skip = "reviewer-summary"
+    elif last_summary_at and newest and newest <= last_summary_at:
+        skip = "addressed"
+    else:
+        skip = ""
+
+    return kind, finding, skip, newest, theirs, lane
+
+
+def emit(source, ident, thread_id, path, line, url, comments, flags,
+         agent, last_summary_at, lane_hint=None):
+    kind, finding, skip, newest, theirs, lane = classify(
+        comments, source, flags, agent, last_summary_at)
+    return {
+        "source": source,
+        "kind": kind,
+        # A summary names its own lane; an inline finding does not, so a thread
+        # is attributed through the review it belongs to (`lane_hint`).
+        "lane": (lane or lane_hint) if kind == "reviewer" else None,
+        "id": ident,
+        "thread_id": thread_id,
+        "finding": finding,
+        "path": path,
+        "line": line,
+        "last_author": comments[-1]["author"] if comments else "",
+        "newest_non_agent_at": newest or None,
+        "skip": skip,
+        "url": url,
+        "body": "\n\n---\n\n".join(c["body"] for c in theirs),
+    }
+
+
+def main():
+    if len(sys.argv) != 3:
+        die(2, "usage: pr-feedback <owner/repo> <pr-number>")
+    repo, pr = sys.argv[1], int(sys.argv[2])
+    if "/" not in repo:
+        die(2, "pr-feedback: repo must be owner/name, got '%s'" % repo)
+    owner, name = repo.split("/", 1)
+    if not os.access(GH, os.X_OK):
+        die(2, "pr-feedback: gh not found")
+
+    agent = gh_run(["api", "user", "--jq", ".login"]).strip()
+
+    issue_comments = gh_rest("repos/%s/issues/%d/comments" % (repo, pr))
+    reviews = gh_rest("repos/%s/pulls/%d/reviews" % (repo, pr))
+    threads = fetch_threads(owner, name, pr)
+
+    # The cut-off: everything said before the worker's newest summary has
+    # already been answered by the commits that summary names.
+    last_summary_at = ""
+    for c in issue_comments:
+        if is_own_summary(c.get("body") or "",
+                          (c.get("user") or {}).get("login"), agent):
+            last_summary_at = max(last_summary_at, c.get("created_at") or "")
+
+    # Which lane raised each inline finding. The finding tag is deliberately
+    # lane-neutral — both lanes write the same one, and authorship settles
+    # nothing because both post under the human's login — so the attribution
+    # runs thread -> its review -> that review's summary marker. One extra
+    # read-only call, and the only way to answer "which reviewer am I replying
+    # to" for a thread.
+    lane_by_review = {}
+    for r in reviews:
+        lane = summary_lane(r.get("body") or "")
+        if lane:
+            lane_by_review[r.get("id")] = lane
+    review_of_comment = {}
+    if lane_by_review:
+        for c in gh_rest("repos/%s/pulls/%d/comments" % (repo, pr)):
+            review_of_comment[c.get("id")] = c.get("pull_request_review_id")
+
+    items = []
+    for t in threads:
+        block = t["comments"]
+        if block["totalCount"] > MAX_THREAD_COMMENTS:
+            die(3, "pr-feedback: %s#%d thread %s has more than %d comments"
+                % (repo, pr, t["path"], MAX_THREAD_COMMENTS))
+        comments = [
+            comment((c.get("author") or {}).get("login"),
+                    (c.get("author") or {}).get("__typename") == "Bot",
+                    c.get("createdAt"), c.get("body"), c.get("url"),
+                    c.get("databaseId"))
+            for c in block["nodes"]
+        ]
+        if not comments:
+            continue
+        flags = set()
+        if t["isResolved"]:
+            flags.add("resolved")
+        if t["isOutdated"]:
+            flags.add("outdated")
+        items.append(emit("thread", comments[0]["id"], t["id"], t["path"],
+                          t.get("line") or t.get("originalLine"),
+                          comments[0]["url"], comments, flags,
+                          agent, last_summary_at,
+                          lane_by_review.get(review_of_comment.get(comments[0]["id"]))))
+
+    for c in issue_comments:
+        user = c.get("user") or {}
+        one = [comment(user.get("login"), user.get("type") == "Bot",
+                       c.get("created_at"), c.get("body"), c.get("html_url"),
+                       c.get("id"))]
+        items.append(emit("comment", c.get("id"), None, None, None,
+                          c.get("html_url"), one, set(), agent, last_summary_at))
+
+    for r in reviews:
+        if not (r.get("body") or "").strip():
+            continue
+        user = r.get("user") or {}
+        one = [comment(user.get("login"), user.get("type") == "Bot",
+                       r.get("submitted_at"), r.get("body"), r.get("html_url"),
+                       r.get("id"))]
+        items.append(emit("review", r.get("id"), None, None, None,
+                          r.get("html_url"), one, set(), agent, last_summary_at))
+
+    for item in items:
+        print(json.dumps(item, sort_keys=True))
+
+    live = [i for i in items if not i["skip"]]
+    print("pr-feedback: %s#%d threads=%d comments=%d reviews=%d actionable=%d "
+          "(reviewer=%d human=%d) skipped=%d"
+          % (repo, pr, len(threads), len(issue_comments), len(reviews), len(live),
+             sum(1 for i in live if i["kind"] == "reviewer"),
+             sum(1 for i in live if i["kind"] == "human"),
+             len(items) - len(live)),
+          file=sys.stderr)
+
+
+if __name__ == "__main__":
+    main()

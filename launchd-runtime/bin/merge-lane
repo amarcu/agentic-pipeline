@@ -1,0 +1,322 @@
+#!/usr/bin/python3
+"""merge-lane - review, then merge, an agent's pull request when fixed checks all pass. No model.
+
+Usage: merge-lane <owner/repo> [--dry-run] [--max <n>]
+
+The owner approved a self-merge lane for StarBonk on 2026-10-13. A model never
+merges: the headless deny-net blocks `gh pr merge` and `gh pr ready` for every
+routine, and that stays. This script is the lane instead. It holds no judgment
+of its own: Grok (through cursor-review) and the Unity gate judge the change,
+and the script only checks their results against rules it cannot bend.
+
+For each open agent PR (bin/agent-prs), in order:
+  1. If Grok has not passed the PR's current head, run `cursor-review --post`
+     with REVIEW_ROUND_MAX=3. It skips a head it already reviewed. Findings are
+     answered by the pr-iterate-night routine; the lane only waits.
+  2. Merge only when ALL hold:
+     - the repo is in MERGE_LANE_REPOS (repos.conf) and the kill switch is absent;
+     - the PR is open, based on the default branch, and GitHub says MERGEABLE;
+     - nobody requested changes (reviewDecision is not CHANGES_REQUESTED);
+     - the newest cursor-review marker is verdict=pass for the PR's current head
+       SHA, and that review's gate line says `passed`;
+     - every changed file is in the phase-1 allowlist below, or in the phase-2
+       scene allowlist with a passing bin/build-smoke on that head. Balance
+       CSVs, project settings, packages and imported assets go to the owner's
+       weekly batch instead;
+     - bin/unity-gate on that exact head says verdict=pass (never
+       pass-no-tests), with a test count at least the one recorded at the last
+       merge.
+  3. Merge with `gh pr merge --squash --match-head-commit <sha>`, so nothing
+     pushed after the review can land, then record the new test count.
+At most MERGE_LANE_MAX_PER_RUN merges per run. Every PR gets one
+`MERGE-LANE:` line, and a merge or a first skip for a head gets a PR comment.
+
+Exit codes: 0 the run finished (whatever it decided), 1 a query failed,
+2 usage or config. A refused PR is a normal outcome, not a failure.
+
+Environment (tests set these): REPOS_CONF, GH_BIN, CURSOR_REVIEW_BIN,
+AGENT_PRS_BIN, UNITY_GATE_BIN, MERGE_LANE_STATE_DIR.
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import subprocess
+import time
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+RUNTIME = os.path.dirname(HERE)
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(RUNTIME, "repos.conf")
+GH = os.environ.get("GH_BIN") or "gh"
+CURSOR_REVIEW = os.environ.get("CURSOR_REVIEW_BIN") or os.path.join(HERE, "cursor-review")
+AGENT_PRS = os.environ.get("AGENT_PRS_BIN") or os.path.join(HERE, "agent-prs")
+UNITY_GATE = os.environ.get("UNITY_GATE_BIN") or os.path.join(HERE, "unity-gate")
+BUILD_SMOKE = os.environ.get("BUILD_SMOKE_BIN") or os.path.join(HERE, "build-smoke")
+STATE_DIR = os.environ.get("MERGE_LANE_STATE_DIR") or os.path.expanduser("~/.config/agentic-skills/merge-lane")
+KILL_SWITCH = os.path.join(STATE_DIR, "OFF")
+MERGEABLE_RETRIES = int(os.environ.get("MERGE_LANE_MERGEABLE_RETRIES", "3"))
+MERGEABLE_WAIT = float(os.environ.get("MERGE_LANE_MERGEABLE_WAIT", "10"))
+REVIEW_ROUND_MAX = "3"
+
+# Phase 1: code, tests and design docs only. Everything else is the owner's
+# weekly batch until the bot playtest band exists (StarBonk agent/PLAN.md).
+ALLOW = [
+    "Assets/_Game/Scripts/*.cs", "Assets/_Game/Scripts/*.cs.meta",
+    "Assets/_Game/Scripts/*.asmdef", "Assets/_Game/Scripts/*.asmdef.meta",
+    "Assets/_Game/Scripts/*.meta",
+    "agent/design/*.md",
+]
+# Phase 2 (the owner, 2026-10-18): the game's own scenes and prefabs, and the editor scripts that
+# wire them. Two checks cover a scene change. unity-gate runs the repo's EditMode tests, and
+# StarBonk's MissingScriptAuditTests open every scene and fail on any missing script, so a broken
+# reference in any scene fails the gate. bin/build-smoke adds what no editor test can show: a Mac
+# build of the head starts, and the scenes it loads first log no missing script.
+SCENE_ALLOW = [
+    "Assets/_Game/Scenes/*.unity", "Assets/_Game/Scenes/*.meta",
+    "Assets/_Game/Prefabs/*.prefab", "Assets/_Game/Prefabs/*.meta",
+    "Assets/_Game/Editor/Wiring/*.cs", "Assets/_Game/Editor/Wiring/*.meta", "Assets/_Game/Editor/Wiring.meta",
+]
+DENY = ["*.csv", "ProjectSettings/*", "Packages/*", "Assets/Imported/*",
+        "CLAUDE.md", "agent/VISION.md", "agent/PLAN.md", "agent/FOCUS.md", ".github/*"]
+
+
+def say(repo, pr, result, reason):
+    print("MERGE-LANE: repo=%s pr=%s result=%s reason=%s" % (repo, pr, result, reason))
+
+
+def sh(args, cwd=None, env=None):
+    return subprocess.run(args, capture_output=True, text=True, cwd=cwd, env=env)
+
+
+def gh_json(args):
+    proc = sh([GH] + args)
+    if proc.returncode != 0:
+        raise RuntimeError("gh %s exit %d: %s" % (" ".join(args[:3]), proc.returncode, proc.stderr.strip()[:200]))
+    return json.loads(proc.stdout or "null")
+
+
+def read_conf(repo):
+    proc = sh(["/bin/bash", "-c", '. "$1" >/dev/null 2>&1 || exit 3\n'
+               'printf "lane %s\\n" "${MERGE_LANE_REPOS[@]}"\n'
+               'printf "max %s\\n" "${MERGE_LANE_MAX_PER_RUN:-}"\n'
+               'printf "path %s\\n" "$(get_repo_path "$2" 2>/dev/null)"\n', "conf", REPOS_CONF, repo])
+    if proc.returncode != 0:
+        return None
+    conf = {"lane": [], "max": 3, "path": ""}
+    for line in proc.stdout.splitlines():
+        key, _, value = line.partition(" ")
+        value = value.strip()
+        if key == "lane" and value:
+            conf["lane"].append(value)
+        elif key == "max" and value.isdigit():
+            conf["max"] = int(value)
+        elif key == "path":
+            conf["path"] = os.path.expanduser(value)
+    return conf
+
+
+def allowed(path):
+    if any(fnmatch.fnmatch(path, pat) for pat in DENY):
+        return False
+    return any(fnmatch.fnmatch(path, pat) for pat in ALLOW)
+
+
+def scene_allowed(path):
+    if any(fnmatch.fnmatch(path, pat) for pat in DENY):
+        return False
+    return any(fnmatch.fnmatch(path, pat) for pat in SCENE_ALLOW)
+
+
+def run_build_smoke(repo_path, head):
+    # run_gate has already fetched the PR head, so the commit exists locally.
+    proc = sh([BUILD_SMOKE, repo_path, head])
+    lines = [l for l in proc.stdout.splitlines() if l.startswith("SMOKE:")]
+    if proc.returncode != 0 or not lines or "result=pass" not in lines[-1]:
+        return lines[-1][len("SMOKE: "):] if lines else "build-smoke printed no result"
+    return None
+
+
+def newest_cursor_review(repo, number):
+    reviews = gh_json(["api", "repos/%s/pulls/%s/reviews" % (repo, number), "--paginate"]) or []
+    best = None
+    for review in reviews:
+        body = review.get("body") or ""
+        first = body.split("\n", 1)[0]
+        if "<!-- cursor-review " not in first:
+            continue
+        marker = dict(re.findall(r"(\w+)=([^\s>]+)", first))
+        gate = re.search(r"^- Gate: `([a-z-]+)`", body, re.M)
+        entry = {"round": int(marker.get("round", "0")), "head": marker.get("head", ""),
+                 "verdict": marker.get("verdict", ""), "gate": gate.group(1) if gate else ""}
+        if best is None or entry["round"] >= best["round"]:
+            best = entry
+    return best
+
+
+def run_gate(repo_path, number, head):
+    # unity-gate builds and tests the exact commit in a throwaway worktree of
+    # the repo, so the commit must exist locally first.
+    if not repo_path or not os.path.isdir(repo_path):
+        return None, "no local checkout (get_repo_path)"
+    proc = sh(["/usr/bin/git", "-C", repo_path, "fetch", "-q", "origin", "pull/%s/head" % number])
+    if proc.returncode != 0:
+        return None, "git fetch of the PR head failed: %s" % proc.stderr.strip()[:120]
+    proc = sh([UNITY_GATE, repo_path, head])
+    try:
+        verdict = json.loads(proc.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return None, "unity-gate printed no verdict"
+    if verdict.get("verdict") != "pass":
+        return None, "unity-gate verdict %s" % verdict.get("verdict")
+    return int(verdict.get("tests", 0)), None
+
+
+def baseline_path(repo):
+    return os.path.join(STATE_DIR, repo.replace("/", "-") + ".tests")
+
+
+def read_baseline(repo):
+    try:
+        return int(open(baseline_path(repo)).read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def commented(repo, number, head):
+    path = os.path.join(STATE_DIR, repo.replace("/", "-") + ".commented")
+    seen = set(open(path).read().split()) if os.path.exists(path) else set()
+    key = "%s@%s" % (number, head[:12])
+    if key in seen:
+        return True
+    with open(path, "a") as handle:
+        handle.write(key + "\n")
+    return False
+
+
+def comment(repo, number, text, dry):
+    body = text + "\n\n<!-- agentic-skills: script=merge-lane repo=%s pr=%s -->" % (repo, number)
+    if not dry:
+        sh([GH, "pr", "comment", str(number), "--repo", repo, "--body", body])
+
+
+def consider(repo, number, conf, dry, merges_left):
+    view = gh_json(["pr", "view", str(number), "--repo", repo, "--json",
+                    "state,baseRefName,headRefOid,mergeable,reviewDecision,isDraft,files"])
+    head = view.get("headRefOid", "")
+    default = gh_json(["repo", "view", repo, "--json", "defaultBranchRef"])["defaultBranchRef"]["name"]
+    if view.get("state") != "OPEN":
+        return "skipped", "not open"
+    if view.get("baseRefName") != default:
+        return "skipped", "base is %s, not %s" % (view.get("baseRefName"), default)
+
+    review = newest_cursor_review(repo, number)
+    if review is None or review["head"] != head:
+        if not dry:
+            env = dict(os.environ, REVIEW_ROUND_MAX=REVIEW_ROUND_MAX)
+            proc = sh([CURSOR_REVIEW, repo, str(number), "--post"], env=env)
+            if proc.returncode == 7:
+                return "skipped", "review rounds exhausted (3); needs the owner"
+            review = newest_cursor_review(repo, number)
+        if review is None or review["head"] != head:
+            return "waiting", "no Grok review of head %s yet" % head[:7]
+    if review["verdict"] != "pass":
+        return "waiting", "Grok verdict %s at round %d; iterate-on-pr answers it" % (review["verdict"], review["round"])
+    if review["gate"] != "passed":
+        return "skipped", "Grok's gate was %s, not passed" % (review["gate"] or "missing")
+    if view.get("reviewDecision") == "CHANGES_REQUESTED":
+        return "skipped", "changes requested"
+    # GitHub computes mergeability lazily and answers UNKNOWN until it has (#64, 2026-10-17).
+    for _ in range(MERGEABLE_RETRIES):
+        if view.get("mergeable") != "UNKNOWN":
+            break
+        time.sleep(MERGEABLE_WAIT)
+        view["mergeable"] = gh_json(["pr", "view", str(number), "--repo", repo, "--json", "mergeable"]).get("mergeable")
+    if view.get("mergeable") != "MERGEABLE":
+        return "skipped", "GitHub says %s" % view.get("mergeable")
+
+    paths = [f["path"] for f in view.get("files") or []]
+    outside = [p for p in paths if not allowed(p) and not scene_allowed(p)]
+    if outside:
+        return "batch", "changes outside phase 1 and 2 (%s); held for the owner's weekly batch" % ", ".join(outside[:4])
+    touches_scenes = any(scene_allowed(p) and not allowed(p) for p in paths)
+
+    if merges_left <= 0:
+        return "waiting", "merge limit for this run reached"
+    tests, problem = run_gate(conf["path"], number, head)
+    if problem:
+        return "skipped", problem
+    if touches_scenes:
+        problem = run_build_smoke(conf["path"], head)
+        if problem:
+            return "skipped", "scene change, and the build smoke test did not pass: %s" % problem
+    baseline = read_baseline(repo)
+    if tests <= 0 or tests < baseline:
+        return "skipped", "test count %d (last merge %d)" % (tests, baseline)
+
+    if dry:
+        return "would-merge", "all checks pass at %s, tests %d" % (head[:7], tests)
+    if view.get("isDraft"):
+        proc = sh([GH, "pr", "ready", str(number), "--repo", repo])
+        if proc.returncode != 0:
+            return "skipped", "gh pr ready failed"
+    proc = sh([GH, "pr", "merge", str(number), "--repo", repo, "--squash", "--match-head-commit", head])
+    if proc.returncode != 0:
+        return "skipped", "gh pr merge refused: %s" % proc.stderr.strip()[:120]
+    with open(baseline_path(repo), "w") as handle:
+        handle.write("%d\n" % tests)
+    return "merged", "Grok pass at %s, gate passed with %d tests (last merge %d)" % (head[:7], tests, baseline)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("repo")
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--max", type=int)
+    args = parser.parse_args()
+    if not re.match(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$", args.repo):
+        print("usage: merge-lane <owner/repo> [--dry-run] [--max <n>]", file=sys.stderr)
+        return 2
+    conf = read_conf(args.repo)
+    if conf is None:
+        print("merge-lane: cannot read %s" % REPOS_CONF, file=sys.stderr)
+        return 2
+    if args.repo not in conf["lane"]:
+        say(args.repo, "-", "refused", "repo not in MERGE_LANE_REPOS")
+        return 0
+    os.makedirs(STATE_DIR, exist_ok=True)
+    if os.path.exists(KILL_SWITCH):
+        say(args.repo, "-", "refused", "kill switch %s is present" % KILL_SWITCH)
+        return 0
+    merges_left = args.max if args.max is not None else conf["max"]
+
+    proc = sh([AGENT_PRS, args.repo])
+    if proc.returncode != 0:
+        print("merge-lane: agent-prs failed: %s" % proc.stderr.strip(), file=sys.stderr)
+        return 1
+    numbers = [line.split("\t")[0] for line in proc.stdout.splitlines() if line.strip()]
+    if not numbers:
+        say(args.repo, "-", "idle", "no open agent PRs")
+        return 0
+    failed = False
+    for number in numbers:
+        try:
+            result, reason = consider(args.repo, number, conf, args.dry_run, merges_left)
+        except (RuntimeError, ValueError, KeyError) as err:
+            failed = True
+            say(args.repo, number, "error", str(err)[:200])
+            continue
+        say(args.repo, number, result, reason)
+        if result == "merged":
+            merges_left -= 1
+            comment(args.repo, number, "**Merged by the merge lane.** %s." % reason, args.dry_run)
+        elif result in ("batch", "skipped") and not args.dry_run:
+            head = gh_json(["pr", "view", str(number), "--repo", args.repo, "--json", "headRefOid"])["headRefOid"]
+            if not commented(args.repo, number, head):
+                comment(args.repo, number, "**Merge lane: not merged.** %s." % reason, False)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

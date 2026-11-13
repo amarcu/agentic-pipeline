@@ -1,0 +1,265 @@
+#!/bin/bash
+# machine — wake, boot, use and release the machines in machines.conf.
+#
+# Usage:
+#   machine list                              every machine and whether it is up
+#   machine status  <name>                    one machine: up, and reachable over SSH
+#   machine wake    desktop                   Wake-on-LAN; waits for Ubuntu (the default boot)
+#   machine boot    desktop <ubuntu|windows>  wake if needed, then boot the named OS once
+#   machine run     <name|local> -- <command…>  run one command there over SSH, or here
+#   machine release <desktop-ubuntu|desktop-windows>   power it off
+#   --dry-run  (anywhere)                     say what would happen; send no packet, change nothing
+#
+# Prints one `MACHINE:` line per action:
+#   MACHINE: <action> <name> result=<ok|refused|timeout|failed> <detail>
+# Exit codes: 0 ok, 1 failed, 2 usage or config, 3 refused (someone is using it,
+# or it is not set up yet), 4 timed out.
+#
+# The rules this script holds, so no caller has to remember them:
+#   * Only the desktop is ever woken, rebooted or powered off. The Macs, the
+#     laptop and the Pi are the human's or always-on; `run` may use them, nothing
+#     here may power them.
+#   * Nothing reboots or powers off a machine someone is logged in to. A GUI or
+#     terminal session at the desk means the human is using it, and a job never
+#     takes the machine out from under them — it is refused, exit 3.
+#   * Windows is reached with a one-time firmware BootNext, never by changing the
+#     default boot and never through GRUB: the next boot after it is Ubuntu again,
+#     and Windows starts through its own boot manager, the path BitLocker expects.
+#   * The wake packet is sent from this host when it is on the desktop's LAN, as
+#     M2 is. No dependency on the Pi, whose SSH needs an interactive Tailscale
+#     check an unattended job cannot pass.
+set -u
+
+HERE=$(cd "$(/usr/bin/dirname "$0")" && pwd)
+CONF="${MACHINES_CONF:-$HERE/../machines.conf}"
+SSH="${MACHINE_SSH:-/usr/bin/ssh}"
+WAIT_SECONDS="${MACHINE_WAIT_SECONDS:-300}"
+POLL_SECONDS="${MACHINE_POLL_SECONDS:-5}"
+
+DRY=0
+ARGS=()
+for a in "$@"; do
+    if [[ "$a" == "--dry-run" ]]; then DRY=1; else ARGS+=("$a"); fi
+done
+set -- "${ARGS[@]+"${ARGS[@]}"}"
+
+say() {  # action name result detail…
+    local action="$1" name="$2" result="$3"; shift 3
+    echo "MACHINE: $action $name result=$result${*:+ $*}"
+}
+
+[[ -r "$CONF" ]] || { echo "machine: cannot read $CONF" >&2; exit 2; }
+# shellcheck source=../machines.conf
+. "$CONF"
+
+tailscale_bin() {
+    local t
+    for t in "${TAILSCALE:-}" /Applications/Tailscale.app/Contents/MacOS/Tailscale \
+             /usr/local/bin/tailscale /opt/homebrew/bin/tailscale /usr/bin/tailscale; do
+        [[ -n "$t" && -x "$t" ]] && { echo "$t"; return 0; }
+    done
+    return 1
+}
+
+# up <host>: the tailnet says this host is online.
+up() {
+    local host="$1" ts
+    ts=$(tailscale_bin) || return 1
+    "$ts" status --json 2>/dev/null | /usr/bin/python3 -c '
+import json, sys
+host = sys.argv[1].lower()
+d = json.load(sys.stdin)
+peers = list((d.get("Peer") or {}).values()) + [d.get("Self") or {}]
+for p in peers:
+    name = (p.get("DNSName") or "").split(".")[0].lower()
+    if name == host and p.get("Online", True if p is d.get("Self") else False):
+        sys.exit(0)
+sys.exit(1)' "$host"
+}
+
+target() {  # name → user@host, or nothing when the pipeline has no login there
+    local host user
+    host=$(get_machine_host "$1"); user=$(get_machine_user "$1")
+    [[ -n "$host" && -n "$user" ]] && echo "$user@$host"
+}
+
+remote() {  # name command… — one non-interactive SSH command
+    local t; t=$(target "$1") || return 255
+    shift
+    "$SSH" -o BatchMode=yes -o ConnectTimeout=8 "$t" "$@"
+}
+
+# `exit 0` and not `true`: Windows' OpenSSH runs PowerShell, which has no `true`,
+# so that probe called every Windows machine unreachable.
+reachable() { remote "$1" "exit 0" >/dev/null 2>&1; }
+
+wait_gone() {  # name — until SSH stops answering or WAIT_SECONDS pass
+    local start; start=$(/bin/date +%s)
+    while reachable "$1"; do
+        (( $(/bin/date +%s) - start >= WAIT_SECONDS )) && return 1
+        /bin/sleep "$POLL_SECONDS"
+    done
+}
+
+wait_for() {  # name — until SSH answers or WAIT_SECONDS pass
+    local start; start=$(/bin/date +%s)
+    while ! reachable "$1"; do
+        (( $(/bin/date +%s) - start >= WAIT_SECONDS )) && return 1
+        /bin/sleep "$POLL_SECONDS"
+    done
+}
+
+# someone_present name: 0 when a person is logged in at the machine. `who` lists
+# desk and terminal sessions; a non-interactive SSH command like this one does
+# not appear in it. Windows' `query user` lists console and RDP sessions. A
+# query that fails counts as someone there: not knowing is never permission.
+someone_present() {
+    local os out
+    os=$(get_machine_os "$1")
+    if [[ "$os" == "windows" ]]; then
+        # `query user` exits 1 with "No User exists" when nobody is logged in:
+        # that answer is the idle machine, not a failed check.
+        if ! out=$(remote "$1" "query user" 2>&1); then
+            printf '%s\n' "$out" | /usr/bin/grep -qi 'No User exists' && return 1
+            return 0
+        fi
+        printf '%s\n' "$out" | /usr/bin/grep -qi -E 'active'
+    else
+        out=$(remote "$1" "who" 2>/dev/null) || return 0
+        [[ -n "$(printf '%s' "$out" | /usr/bin/tr -d '[:space:]')" ]]
+    fi
+}
+
+send_wake() {
+    if [[ -n "${MACHINE_WOL_SEND:-}" ]]; then
+        "$MACHINE_WOL_SEND" "$DESKTOP_WOL_MAC" "$DESKTOP_WOL_BROADCAST"
+        return
+    fi
+    /usr/bin/python3 - "$DESKTOP_WOL_MAC" "$DESKTOP_WOL_BROADCAST" <<'PY'
+import socket, sys
+mac, broadcast = sys.argv[1], sys.argv[2]
+raw = bytes.fromhex(mac.replace(":", "").replace("-", ""))
+packet = b"\xff" * 6 + raw * 16
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+for _ in range(3):
+    s.sendto(packet, (broadcast, 9))
+PY
+}
+
+cmd_list() {
+    local name host
+    for name in m2 m4 desktop-ubuntu desktop-windows laptop pi; do
+        host=$(get_machine_host "$name")
+        if [[ -z "$host" ]]; then
+            printf '%-16s %-8s %s\n' "$name" "$(get_machine_os "$name")" "not on the tailnet"
+        elif up "$host"; then
+            printf '%-16s %-8s %s\n' "$name" "$(get_machine_os "$name")" "up ($host)"
+        else
+            printf '%-16s %-8s %s\n' "$name" "$(get_machine_os "$name")" "down ($host)"
+        fi
+    done
+}
+
+cmd_status() {
+    local name="$1" host
+    host=$(get_machine_host "$name")
+    [[ -n "$host" ]] || { say status "$name" refused "not on the tailnet"; return 3; }
+    if ! up "$host"; then say status "$name" ok "down"; return 0; fi
+    if [[ -n "$(target "$name")" ]] && reachable "$name"; then
+        say status "$name" ok "up ssh=yes"
+    else
+        say status "$name" ok "up ssh=no"
+    fi
+}
+
+cmd_wake() {
+    [[ "$1" == "desktop" ]] || { say wake "$1" refused "only the desktop is woken"; return 3; }
+    if reachable desktop-ubuntu; then say wake desktop ok "already up (ubuntu)"; return 0; fi
+    if (( DRY )); then say wake desktop ok "dry-run: would send the wake packet and wait ${WAIT_SECONDS}s for ubuntu"; return 0; fi
+    send_wake || { say wake desktop failed "could not send the wake packet"; return 1; }
+    if wait_for desktop-ubuntu; then say wake desktop ok "ubuntu up"; return 0; fi
+    say wake desktop timeout "no SSH from ubuntu within ${WAIT_SECONDS}s"; return 4
+}
+
+cmd_boot() {
+    local which="$1" os="${2:-}"
+    [[ "$which" == "desktop" ]] || { say boot "$which" refused "only the desktop is rebooted"; return 3; }
+    case "$os" in
+        ubuntu)
+            if reachable desktop-ubuntu; then say boot desktop ok "ubuntu already up"; return 0; fi
+            if [[ -n "$(target desktop-windows)" ]] && reachable desktop-windows; then
+                if someone_present desktop-windows; then say boot desktop refused "someone is using windows"; return 3; fi
+                if (( DRY )); then say boot desktop ok "dry-run: would restart windows into ubuntu"; return 0; fi
+                remote desktop-windows "shutdown /r /t 0" >/dev/null 2>&1
+                /bin/sleep "$POLL_SECONDS"
+                wait_for desktop-ubuntu && { say boot desktop ok "ubuntu up"; return 0; }
+                say boot desktop timeout "ubuntu did not come back within ${WAIT_SECONDS}s"; return 4
+            fi
+            cmd_wake desktop | /usr/bin/sed 's/^MACHINE: wake /MACHINE: boot /'
+            return "${PIPESTATUS[0]}"
+            ;;
+        windows)
+            [[ -n "$DESKTOP_WINDOWS_BOOT_ENTRY" ]] || { say boot desktop refused "DESKTOP_WINDOWS_BOOT_ENTRY is not set in machines.conf"; return 3; }
+            # Without a login there the job cannot run and nothing can boot it
+            # back, so the desktop would be left on Windows.
+            [[ -n "$(target desktop-windows)" ]] || { say boot desktop refused "desktop-windows has no host or pipeline login in machines.conf"; return 3; }
+            if reachable desktop-windows; then say boot desktop ok "windows already up"; return 0; fi
+            if ! reachable desktop-ubuntu; then
+                if (( DRY )); then say boot desktop ok "dry-run: would wake ubuntu, then boot windows once via BootNext $DESKTOP_WINDOWS_BOOT_ENTRY"; return 0; fi
+                cmd_wake desktop >/dev/null || { say boot desktop failed "could not wake the desktop"; return 1; }
+            fi
+            if someone_present desktop-ubuntu; then say boot desktop refused "someone is using ubuntu"; return 3; fi
+            if (( DRY )); then say boot desktop ok "dry-run: would boot windows once via BootNext $DESKTOP_WINDOWS_BOOT_ENTRY"; return 0; fi
+            if ! remote desktop-ubuntu "sudo -n /usr/bin/efibootmgr --bootnext $DESKTOP_WINDOWS_BOOT_ENTRY >/dev/null && sudo -n /usr/bin/systemctl reboot" >/dev/null 2>&1; then
+                # A reboot drops the connection, so only a refusal before it counts.
+                if reachable desktop-ubuntu && ! someone_present desktop-ubuntu; then
+                    /bin/sleep "$POLL_SECONDS"
+                    if reachable desktop-ubuntu; then say boot desktop failed "ubuntu refused BootNext or reboot (sudoers?)"; return 1; fi
+                fi
+            fi
+            wait_for desktop-windows && { say boot desktop ok "windows up"; return 0; }
+            say boot desktop timeout "windows did not answer within ${WAIT_SECONDS}s"; return 4
+            ;;
+        *) echo "usage: machine boot desktop <ubuntu|windows>" >&2; return 2 ;;
+    esac
+}
+
+cmd_run() {
+    local name="$1"; shift
+    [[ "${1:-}" == "--" ]] && shift
+    [[ $# -gt 0 ]] || { echo "usage: machine run <name> -- <command…>" >&2; return 2; }
+    if [[ "$name" == "local" ]]; then
+        if (( DRY )); then say run local ok "dry-run: would run: $*"; return 0; fi
+        "$@"; return
+    fi
+    [[ -n "$(target "$name")" ]] || { say run "$name" refused "no pipeline login configured for $name"; return 3; }
+    if (( DRY )); then say run "$name" ok "dry-run: would run: $*"; return 0; fi
+    remote "$name" "$@"
+}
+
+cmd_release() {
+    local name="$1" os
+    case "$name" in desktop-ubuntu|desktop-windows) ;; *) say release "$name" refused "only the desktop is powered off"; return 3 ;; esac
+    reachable "$name" || { say release "$name" ok "already down"; return 0; }
+    if someone_present "$name"; then say release "$name" refused "someone is using it"; return 3; fi
+    if (( DRY )); then say release "$name" ok "dry-run: would power it off"; return 0; fi
+    os=$(get_machine_os "$name")
+    if [[ "$os" == "windows" ]]; then
+        remote "$name" "shutdown /s /t 0" >/dev/null 2>&1
+    else
+        remote "$name" "sudo -n /usr/bin/systemctl poweroff" >/dev/null 2>&1
+    fi
+    if wait_gone "$name"; then say release "$name" ok "powered off"; return 0; fi
+    say release "$name" failed "still answering after the power-off (sudoers?)"; return 1
+}
+
+case "${1:-}" in
+    list)    cmd_list ;;
+    status)  [[ $# -eq 2 ]] || { echo "usage: machine status <name>" >&2; exit 2; }; cmd_status "$2" ;;
+    wake)    [[ $# -eq 2 ]] || { echo "usage: machine wake desktop" >&2; exit 2; }; cmd_wake "$2" ;;
+    boot)    [[ $# -eq 3 ]] || { echo "usage: machine boot desktop <ubuntu|windows>" >&2; exit 2; }; cmd_boot "$2" "$3" ;;
+    run)     [[ $# -ge 3 ]] || { echo "usage: machine run <name> -- <command…>" >&2; exit 2; }; shift; cmd_run "$@" ;;
+    release) [[ $# -eq 2 ]] || { echo "usage: machine release <desktop-ubuntu|desktop-windows>" >&2; exit 2; }; cmd_release "$2" ;;
+    *)       /usr/bin/sed -n '2,12p' "$0" >&2; exit 2 ;;
+esac

@@ -1,0 +1,17 @@
+#!/bin/bash
+# Mock claude-cli that hangs while writing NOTHING — the 2026-07-06
+# zero-output stall class. Unlike `hang`, it never emits a byte, so the
+# first-output watchdog (not the wall-clock one) should kill it.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.128 (Claude Code) [MOCK: stall]"
+    exit 0
+fi
+
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+# Sleep in 1-second chunks so we're responsive to signals
+while true; do
+    sleep 1
+done

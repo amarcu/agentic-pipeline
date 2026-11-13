@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":8,
+ "total_cost_usd":0.3110,"session_id":"smoke-fixture-denied",
+ "permission_denials":[{"tool_name":"Bash","tool_input":{"command":"gh issue create --repo amarcu/StarBonk --title 'Add a test'"}}],
+ "result":"PROPOSED: amarcu/StarBonk#0 | shape:chore | size:S | Add a test",
+ "modelUsage":{"claude-sonnet-5":{"inputTokens":6,"outputTokens":410,
+  "cacheReadInputTokens":22110,"cacheCreationInputTokens":5002}}}

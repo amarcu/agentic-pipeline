@@ -1,0 +1,12 @@
+#!/bin/bash
+# Mock claude-cli that fails with the expired-OAuth 401 we hit on
+# 2026-06-24/25 — every invocation died in a few seconds with an
+# authentication error. Exercises the runner's auth canary.
+
+if [[ "$1" == "--version" ]]; then
+    echo "2.1.128 (Claude Code) [MOCK: auth-error]"
+    exit 0
+fi
+
+echo 'API Error: 401 {"type":"error","error":{"type":"authentication_error","message":"OAuth token has expired."}}'
+exit 1

@@ -1,0 +1,16 @@
+{
+  "name": "amarcu-skills",
+  "description": "The agentic-skills pipeline: Claude Code skills for autonomous multi-repo development.",
+  "owner": {
+    "name": "Alexandru Marcu",
+    "url": "https://github.com/amarcu"
+  },
+  "plugins": [
+    {
+      "name": "agentic-skills",
+      "source": "./",
+      "category": "workflow",
+      "homepage": "https://github.com/amarcu/agentic-pipeline"
+    }
+  ]
+}

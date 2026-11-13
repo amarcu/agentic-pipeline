@@ -1,0 +1,302 @@
+#!/bin/bash
+# pr-review-bundle — assemble an isolated review context for one pull request.
+#
+# The reviewer and the author are the same model, account and machine, so
+# independence cannot be achieved by telling the reviewer to ignore the
+# author's framing. It is achieved by NOT FETCHING it: this bundle contains
+# the diff and the originating issue's acceptance criteria, and deliberately
+# omits the PR body, the commit messages and every worker comment.
+#
+# Bundle contents, written to <outdir>:
+#   meta.json              the PR's gh JSON, plus a `bundle` block recording
+#                          head_sha and the exported source path
+#   diff.patch             the unified diff at head
+#   files.json             per-file patch hunks (needed to anchor inline comments)
+#   tree.txt               what lives in the directories the diff touches, at head
+#   src/                   the source tree at head_sha (git archive — no .git)
+#   source-repo            the checkout src/ was exported from, one line
+#   <sibling>              a link to each `path ../<sibling>` checkout the repo's
+#                          requirements manifest names, so the gate resolves it
+#   acceptance-criteria.md the linked issue's `## Acceptance criteria` SECTION —
+#                          the contract the PR must meet, and nothing else from
+#                          that issue
+#
+# Usage: pr-review-bundle <owner/repo> <pr-number> [outdir] [--allow-pipeline]
+# Exits 3 if the PR is closed/merged, 4 if it touches the pipeline itself.
+# Exits 5 (the PR closes no issue) or 6 (the issue carries no acceptance
+# criteria) only AFTER writing a complete bundle: those are advisory, not
+# refusals — the reviewer reviews against the diff alone. review-pr Step 0
+# refuses on 4 alone, which is why nothing else lands in that range.
+#
+# --allow-pipeline turns that exit-4 refusal into a recorded fact: the bundle
+# is built, the manifest carries `bundle.pipeline_diff`, and pipeline-notice.md
+# states what it means. It exists for one caller. The refusal is right for
+# `review-pr`, where a Claude reviewer would be passing judgement on the
+# guardrails Claude runs under; it is wrong for `cursor-review`, whose reviewer
+# is a different vendor's model, and where a change to the guardrails is
+# exactly what most deserves an outside reader. cursor-review passes this flag
+# only after its own model-independence check has passed, so the two
+# guarantees are one guarantee: a Claude model can never be the thing reviewing
+# a pipeline PR. Without the flag nothing here changes.
+
+set -euo pipefail
+
+# The flag may sit anywhere; everything else stays positional.
+ALLOW_PIPELINE=0
+_args=()
+for _a in "$@"; do
+    if [[ "$_a" == "--allow-pipeline" ]]; then
+        ALLOW_PIPELINE=1
+    else
+        _args+=("$_a")
+    fi
+done
+set -- ${_args[@]+"${_args[@]}"}
+
+REPO="${1:?usage: pr-review-bundle <owner/repo> <pr-number> [outdir] [--allow-pipeline]}"
+PR="${2:?usage: pr-review-bundle <owner/repo> <pr-number> [outdir] [--allow-pipeline]}"
+OUT="${3:-/tmp/review-${REPO//\//-}-$PR}"
+
+GH=$(command -v gh || echo "$HOME/.local/bin/gh")
+[[ -x "$GH" ]] || { echo "pr-review-bundle: gh not found" >&2; exit 2; }
+
+REPOS_CONF="${REPOS_CONF:-$(/usr/bin/dirname "$0")/../repos.conf}"
+
+info=$("$GH" pr view "$PR" --repo "$REPO" \
+  --json number,state,isDraft,headRefName,headRefOid,baseRefName,changedFiles,closingIssuesReferences)
+
+state=$(printf '%s' "$info" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["state"])')
+if [[ "$state" != "OPEN" ]]; then
+    echo "pr-review-bundle: $REPO#$PR is $state — nothing to review" >&2
+    exit 3
+fi
+
+/bin/mkdir -p "$OUT"
+printf '%s' "$info" > "$OUT/meta.json"
+
+head_sha=$(printf '%s' "$info" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["headRefOid"])')
+base_ref=$(printf '%s' "$info" | /usr/bin/python3 -c 'import json,sys; print(json.load(sys.stdin)["baseRefName"])')
+
+"$GH" pr diff "$PR" --repo "$REPO" > "$OUT/diff.patch"
+"$GH" api "repos/$REPO/pulls/$PR/files" --paginate > "$OUT/files.json"
+
+# Self-modification guard: a Claude reviewer must never review the pipeline
+# that runs it. Escalate to a human instead — unless the caller has declared
+# that its reviewer is not Claude, which is what --allow-pipeline means.
+#
+# CLAUDE.md is on that list because it declares the verify gate, and
+# cursor-review executes that gate's command. A PR editing it changes what the
+# reviewer runs, which is a pipeline change however product-shaped the rest of
+# the diff looks. Only that branch is anchored with `$`: the others match a
+# path prefix and would never match if the anchor applied to them too.
+pipeline_diff=false
+if /usr/bin/grep -qE '^\+\+\+ b/(launchd-runtime/|.*\.plist|\.github/|[a-z-]+/SKILL\.md|(.*/)?CLAUDE\.md$)' "$OUT/diff.patch"; then
+    if [[ "$ALLOW_PIPELINE" -eq 0 ]]; then
+        echo "pr-review-bundle: $REPO#$PR modifies the pipeline itself — escalate, do not review" >&2
+        exit 4
+    fi
+    pipeline_diff=true
+    /bin/cat > "$OUT/pipeline-notice.md" <<'NOTICE'
+# This pull request modifies the pipeline itself
+
+Its diff touches `launchd-runtime/`, a `*.plist`, `.github/` or a skill's
+`SKILL.md` — the machinery that proposes, writes, reviews and merges the work
+in this repository.
+
+An independent, non-Claude reviewer is permitted to review it. A change to the
+guardrails is the change that most needs an outside reader, and the human still
+merges.
+
+A Claude reviewer must not: it would be passing judgement on the guardrails it
+runs under. `review-pr` refuses this pull request with exit 4 and escalates,
+and that refusal is unchanged — this bundle was built only because the caller
+declared its reviewer is a different vendor's model.
+NOTICE
+fi
+
+# The reviewer has to run the repo's gate and resolve symbols for itself, and
+# neither is possible from a diff. `git archive` hands over a plain tree at the
+# head SHA: no .git, no worktree to remove, and nothing that can disturb the
+# author's checkout.
+#
+# A round-2 rebuild extracts over the round-1 tree in the same bundle
+# directory, so a file the new head DELETED can linger. That is deliberate:
+# GameTwo's tracked tree archives to 697 MB, and keeping a directory per SHA
+# would put ~2 GB in /tmp for one three-round review. Overwriting in place is
+# the cheaper wrong, and every file the diff touches is rewritten correctly.
+src_dir=""
+src_note=""
+if [[ ! -f "$REPOS_CONF" ]]; then
+    src_note="repos.conf not found at $REPOS_CONF — no source tree exported"
+else
+    # shellcheck source=../repos.conf
+    . "$REPOS_CONF"
+    repo_path=$(get_repo_path "$REPO")
+    if [[ -z "$repo_path" || ! -d "$repo_path" ]]; then
+        src_note="$REPO is not in repos.conf's get_repo_path map — no source tree exported"
+    else
+        /usr/bin/git -C "$repo_path" fetch -q origin "pull/$PR/head" 2>/dev/null || true
+        if /usr/bin/git -C "$repo_path" cat-file -e "$head_sha^{commit}" 2>/dev/null; then
+            /bin/mkdir -p "$OUT/src"
+            /usr/bin/git -C "$repo_path" archive "$head_sha" | /usr/bin/tar -x -C "$OUT/src"
+            src_dir="$OUT/src"
+        else
+            src_note="$head_sha is not reachable in $repo_path — no source tree exported"
+        fi
+    fi
+fi
+
+# src/ has no .git, so a gate cannot find the checkout it came from — and with it
+# any warm build cache the host keeps there. StarBonk's Unity gate imports from
+# nothing without one: 3.1 GB and ~100 s per review instead of a ~20 s
+# copy-on-write clone (2026-10-14). source-repo names that checkout; the repo's
+# own gate reads it (StarBonk's Tools/gate.sh, amarcu/StarBonk#61). It sits
+# beside src/, not in it, so the tree under review stays exactly the head SHA.
+if [[ -n "$src_dir" ]]; then
+    printf '%s\n' "$repo_path" > "$OUT/source-repo"
+fi
+
+# A gate that builds against a sibling checkout cannot find it from src/:
+# GameTwo's client includes game-engine through ../game-engine, and a bare src/ failed
+# every review gate on 'game-engine/Platform.h' file not found (GameTwo #162). The
+# repo's requirements manifest names each sibling with a `path ../<name>` line;
+# each one present on this host is linked beside src/, so ../<name> resolves as
+# it does in the checkout. Linked, not copied: it is the same checkout the
+# workers build against, and check-requirements holds it to the right branch.
+siblings=""
+if [[ -n "$src_dir" ]]; then
+    manifest="$repo_path/agent/requirements.conf"
+    [[ -f "$manifest" ]] || manifest="$(/usr/bin/dirname "$0")/../requirements-templates/${REPO//\//-}.conf"
+    if [[ -f "$manifest" ]]; then
+        while read -r sib; do
+            [[ -n "$sib" && "$sib" != src && -d "$repo_path/../$sib" ]] || continue
+            [[ -e "$OUT/$sib" ]] || /bin/ln -s "$(cd "$repo_path/../$sib" && pwd)" "$OUT/$sib"
+            siblings="${siblings:+$siblings }$sib"
+        done < <(/usr/bin/sed -nE 's#^path[[:space:]]+\.\./([A-Za-z0-9._-]+)/?([[:space:]].*)?$#\1#p' "$manifest")
+    fi
+fi
+
+# tree.txt is orientation, not inventory: what sits NEXT TO the changed files.
+# The recursive listing it replaced was 427 KB — 5,649 paths, ~107k tokens — on
+# StarBonk whatever the diff contained; the bounded form is 1.2 KB for the
+# one-file diff on GameTwo#15. The reviewer walks src/ when it needs more.
+/usr/bin/python3 - "$OUT" "$GH" "$REPO" "$head_sha" <<'PY'
+import json, os, subprocess, sys
+out, gh, repo, sha = sys.argv[1:5]
+CAP = 400
+
+changed = [f["filename"] for f in json.load(open(os.path.join(out, "files.json")))]
+dirs = sorted({os.path.dirname(p) for p in changed})
+
+try:
+    paths = subprocess.run(
+        [gh, "api", "repos/%s/git/trees/%s?recursive=1" % (repo, sha),
+         "--jq", '.tree[] | select(.type=="blob") | .path'],
+        capture_output=True, text=True, check=True).stdout.split("\n")
+except Exception:
+    paths = []
+
+by_dir = {}
+for p in (p.strip() for p in paths):
+    if p and os.path.dirname(p) in dirs:
+        by_dir.setdefault(os.path.dirname(p), []).append(p)
+
+changed_set = set(changed)
+body = []
+for d in dirs:
+    # Falling back to the changed paths keeps the file useful when the tree
+    # call fails or the repo is too large for the API to return untruncated.
+    entries = sorted(by_dir.get(d) or [p for p in changed_set if os.path.dirname(p) == d])
+    body.append("%s/" % (d or "."))
+    for e in entries:
+        body.append("  %s %s" % ("*" if e in changed_set else " ", os.path.basename(e)))
+
+truncated = len(body) > CAP
+header = [
+    "# Files at %s in the directories this PR touches. `*` marks a changed file." % sha[:12],
+    "# Deliberately not the whole tree — the full source is exported under src/.",
+    "",
+]
+open(os.path.join(out, "tree.txt"), "w").write(
+    "\n".join(header + body[:CAP] + (["(truncated)"] if truncated else [])) + "\n")
+PY
+
+# The contract the PR must meet is the ISSUE, not the PR's own description of
+# itself — and within the issue, only its acceptance criteria. `gh pr view`
+# does not return issue bodies under closingIssuesReferences (checked on gh
+# 2.92: the field is absent, so every bundle ever built carried the "issue
+# body empty" placeholder), so fetch the issue explicitly. Only the
+# `## Acceptance criteria` section is written: an issue's implementation plan
+# is the author's own framing arriving by another route, and handing it to the
+# reviewer would collapse the independence this bundle exists to create.
+criteria_status=0
+issue=$(printf '%s' "$info" | /usr/bin/python3 -c '
+import json, sys
+refs = json.load(sys.stdin).get("closingIssuesReferences") or []
+print(refs[0]["number"] if refs else "")')
+
+if [[ -z "$issue" ]]; then
+    echo "(This PR closes no issue. Review against the diff alone.)" > "$OUT/acceptance-criteria.md"
+    criteria_status=5
+else
+    /usr/bin/python3 - "$OUT/acceptance-criteria.md" "$GH" "$REPO" "$issue" <<'PY' || criteria_status=6
+import json, re, subprocess, sys
+path, gh, repo, number = sys.argv[1:5]
+
+try:
+    issue = json.loads(subprocess.run(
+        [gh, "issue", "view", number, "--repo", repo, "--json", "title,body"],
+        capture_output=True, text=True, check=True).stdout)
+except Exception:
+    open(path, "w").write(
+        "(Issue #%s could not be fetched. Review against the diff alone.)\n" % number)
+    sys.exit(1)
+
+title = (issue.get("title") or "").strip()
+lines = (issue.get("body") or "").replace("\r\n", "\n").split("\n")
+
+start = next((i for i, l in enumerate(lines)
+              if re.match(r'^##\s+acceptance criteria\s*:?\s*$', l.strip(), re.I)), None)
+if start is None:
+    open(path, "w").write(
+        '(Issue #%s "%s" has no "## Acceptance criteria" section. '
+        'Review against the diff alone.)\n' % (number, title))
+    sys.exit(1)
+
+# A `###` sub-heading stays inside the section; the next `## ` ends it.
+end = next((j for j in range(start + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
+open(path, "w").write("# Acceptance criteria — issue #%s: %s\n\n%s\n"
+                      % (number, title, "\n".join(lines[start:end]).rstrip()))
+PY
+fi
+
+/usr/bin/python3 - "$OUT/meta.json" "$head_sha" "$src_dir" "$src_note" "$pipeline_diff" <<'PY'
+import json, sys
+path, head_sha, src, note, pipeline = sys.argv[1:6]
+meta = json.load(open(path))
+meta["bundle"] = {"head_sha": head_sha, "src": src or None}
+if note:
+    meta["bundle"]["src_note"] = note
+if pipeline == "true":
+    meta["bundle"]["pipeline_diff"] = True
+    meta["bundle"]["pipeline_note"] = (
+        "This PR modifies the pipeline. It was bundled under --allow-pipeline, "
+        "which only a non-Claude reviewer may pass; a Claude reviewer escalates "
+        "instead. See pipeline-notice.md.")
+json.dump(meta, open(path, "w"), indent=2)
+PY
+
+echo "bundle: $OUT"
+echo "  head_sha:  $head_sha"
+echo "  base_ref:  $base_ref"
+echo "  diff:      $(/usr/bin/wc -l < "$OUT/diff.patch" | tr -d ' ') lines"
+echo "  files:     $(/usr/bin/python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$OUT/files.json")"
+echo "  src:       ${src_dir:-none — $src_note}"
+[[ -z "$siblings" ]] || echo "  siblings:  $siblings (linked beside src/)"
+echo "  criteria:  $(/usr/bin/wc -c < "$OUT/acceptance-criteria.md" | tr -d ' ') bytes (exit $criteria_status)"
+if [[ "$pipeline_diff" == "true" ]]; then
+    echo "  pipeline:  this PR modifies the pipeline — bundled under --allow-pipeline,"
+    echo "             which only a non-Claude reviewer may pass (pipeline-notice.md)"
+fi
+
+exit "$criteria_status"

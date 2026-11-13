@@ -1,0 +1,23 @@
+# The lines each scheduled routine's final message owes, each at the start of a
+# line of its own. One row per required line; alternatives within a row are
+# separated by `|`, and either satisfies it. A `-` row means the routine owes a
+# non-empty result and nothing more. Tokens are literal text with no regex
+# metacharacter other than that `|`.
+#
+# Read by bin/_run.sh, which warns in the log when a captured run's final message
+# is missing a line, and by tests/smoke/check-envelope.sh, which fails the
+# rehearsal. In a headless run the final message is all that survives, so a line
+# printed in an earlier turn, or inside a sentence, is a line nobody can read
+# (#52). tests/static/test_routine_contracts.sh keeps this in step with prompts/.
+morning-triage	TRIAGE:
+morning-proposals	PROPOSED:|HALT:
+dispatch-tasks-night	DISPATCH GATE:
+dispatch-tasks-night	DISPATCH END:
+pr-review-night	REVIEW:
+pr-iterate-night	ITERATE:
+daily-summary-routine	SUMMARY:
+skill-assess-weekly	ASSESS:|HALT:
+wake-status-digest	-
+daily-review-nudge	-
+merge-lane-night	MERGE-LANE-FAILED:|MERGE-LANE-RUN:
+playtest-build-night	PLAYTEST-BUILD-FAILED:|PLAYTEST-BUILD-RUN:

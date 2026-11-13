@@ -1,0 +1,109 @@
+#!/usr/bin/python3
+"""Print one REVIEW: line for the week's review rounds, or nothing.
+
+Usage: review-line <YYYY-MM-DD>
+
+Asks launchd-runtime/bin/review-rollup for the agent pull requests opened in
+ACTIVE_REPOS (the digest's roster, and no other repo) in the seven days ending
+on the given date, and says in one line what review cost
+them: how many passed every review, the median rounds a lane took, and how
+many used every round a lane is allowed.
+
+One thing is named PR by PR: a pull request that merged ON THE GIVEN DATE with
+no pass on the commit that merged. The merge lane never does that, so it is a
+merge made outside the lane: the owner's own, or an interactive session's on
+the owner's word. It is named on the evening it happened and not again, since
+a line that repeats for a week teaches the reader to skip it. The date is the
+merge's local date on this host. A PR opened more than seven days before it
+merged is outside the window and is not named; `make review-rollup` shows it.
+
+The window is the PR's opening date, closed at both ends, which is what
+review-rollup's --since and --until mean.
+
+Silence is a valid answer, as for spend-today and friction: no agent PR with a
+marked review in the window, and every repo read, prints nothing and exits 0.
+So does a rollup that is missing, hung past TIMEOUT_S or printed something
+unreadable: the digest still goes out, and a line that guessed would be worse
+than no line.
+
+A repo the rollup could not read is never silence. It is named at the end as
+`(error)`, the digest's own convention, and when it leaves nothing else to
+report the line is `REVIEW: no review read in 7 days · (error) <repo>`, so a
+repo GitHub would not answer for is not read as a quiet week.
+
+TIMEOUT_S sits under the 120 s a Bash tool call gets by default: a script the
+harness kills mid-run prints a tool error into the digest's turn, where this
+prints nothing. Output is written as UTF-8 bytes: under launchd there is no
+locale.
+"""
+import datetime
+import json
+import os
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ROLLUP = os.environ.get("REVIEW_ROLLUP_BIN") or os.path.join(
+    HERE, "..", "..", "..", "launchd-runtime", "bin", "review-rollup")
+WINDOW_DAYS = 7
+NAMED = 3
+TIMEOUT_S = float(os.environ.get("REVIEW_LINE_TIMEOUT_S") or 90)
+
+
+def merged_on(pr):
+    """The local date a PR merged on, or None. GitHub's stamp ends in Z, which
+    fromisoformat rejects before 3.11."""
+    stamp = pr.get("merged_at")
+    if not stamp:
+        return None
+    return datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00")).astimezone().date()
+
+
+def main():
+    if len(sys.argv) != 2:
+        sys.stderr.write("usage: review-line <YYYY-MM-DD>\n")
+        return 2
+    try:
+        today = datetime.date.fromisoformat(sys.argv[1])
+    except ValueError:
+        sys.stderr.write("review-line: not a date: %s\n" % sys.argv[1])
+        return 2
+    since = (today - datetime.timedelta(days=WINDOW_DAYS - 1)).isoformat()
+
+    try:
+        out = subprocess.run([ROLLUP, "--json", "--since", since, "--until", today.isoformat(),
+                              "--active", "--keep-going"],
+                             capture_output=True, text=True, timeout=TIMEOUT_S)
+        if out.returncode != 0:
+            return 0
+        data = json.loads(out.stdout)
+        total = data["total"]
+        failed = [repo["repo"] for repo in data["repos"] if "error" in repo]
+        if not total["reviewed"] and not failed:
+            return 0
+        unpassed = ["%s#%d" % (repo["repo"], pr["number"])
+                    for repo in data["repos"] for pr in repo.get("prs", [])
+                    if pr["merged_head_unpassed"] and merged_on(pr) == today]
+        parts = []
+        if total["reviewed"]:
+            parts = ["%d clean" % total["clean"], "median %g rounds" % total["median_rounds"]]
+        if total["at_round_cap"]:
+            parts.append("%d at the round cap" % total["at_round_cap"])
+        if unpassed:
+            more = len(unpassed) - NAMED
+            parts.append("merged today on an unpassed commit: %s%s" % (
+                ", ".join(unpassed[:NAMED]), " (+%d more)" % more if more > 0 else ""))
+        errors = "".join(" · (error) %s" % r for r in failed[:NAMED])
+        if total["reviewed"]:
+            line = "REVIEW: %d reviewed of %d agent PRs opened in %d days — %s%s\n" % (
+                total["reviewed"], total["agent_prs"], WINDOW_DAYS, ", ".join(parts), errors)
+        else:
+            line = "REVIEW: no review read in %d days%s\n" % (WINDOW_DAYS, errors)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+        return 0
+    sys.stdout.buffer.write(line.encode("utf-8"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

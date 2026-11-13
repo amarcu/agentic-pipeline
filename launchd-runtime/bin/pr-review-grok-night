@@ -1,0 +1,86 @@
+#!/bin/bash
+# pr-review-grok-night — the pr-review-night routine's precheck: Grok (bin/cursor-review) reviews
+# every open agent draft PR in MERGE_LANE_REPOS, oldest first, at most PR_REVIEW_GROK_MAX a run.
+#
+# Why it runs at 05:00 instead of only inside the 07:00 merge lane: the merge lane trusts Grok
+# alone, so a Claude review at 05:00 was spend no decision used, and Grok's findings arrived at
+# 07:00, an hour after pr-iterate-night (06:00) had already run. Each finding then waited a full
+# day for a worker, and every review round cost a night (2026-10-17: #66, #67, #68). Now Grok
+# reviews at 05:00, iterate answers it at 06:00, and the merge lane re-checks the new head at 07:00.
+#
+# cursor-review never re-reviews a head it already posted on, so a PR nobody touched costs
+# nothing. Exit 10 (no model) when every active repo is a merge-lane repo; otherwise exit 0 and
+# the model reviews the other repos with /review-pr, as prompts/pr-review-night.md says.
+#
+# The first line printed is the run summary (the runner records it as the skip reason).
+set -u
+HERE=$(cd "$(/usr/bin/dirname "$0")" && pwd)
+CONF="${REPOS_CONF:-$HERE/../repos.conf}"
+REVIEW="${CURSOR_REVIEW_BIN:-$HERE/cursor-review}"
+AGENT_PRS="${AGENT_PRS_BIN:-$HERE/agent-prs}"
+MAX="${PR_REVIEW_GROK_MAX:-4}"
+# pr-iterate-night starts at 06:00. No review starts after BUDGET seconds, and each review is killed
+# at REVIEW_CAP seconds whatever hangs (the gate is capped inside it too), so the worst case — a
+# review started at the budget and killed at the cap — ends at 3200 s (05:53), inside the plist's
+# 3300 s precheck limit.
+BUDGET="${PR_REVIEW_GROK_BUDGET_SECONDS:-2100}"
+REVIEW_CAP="${PR_REVIEW_GROK_REVIEW_SECONDS:-1100}"
+export CURSOR_REVIEW_GATE_TIMEOUT="${CURSOR_REVIEW_GATE_TIMEOUT:-600}"
+# Job control puts each review in its own process group, so a cap kills cursor-agent and the gate too.
+set -m
+START=$(/bin/date +%s)
+. "$CONF" || { echo "REVIEW: grok error reason=cannot read $CONF"; exit 1; }
+
+# dispatch-tasks-night writes to the same repos and branches, and has run past its cap before.
+if /usr/bin/pgrep -f "_run.sh dispatch-tasks-night" >/dev/null 2>&1; then
+    echo "REVIEW: skipped=dispatch-still-running"
+    exit 10
+fi
+
+OUT=$(/usr/bin/mktemp "${TMPDIR:-/tmp}/pr-review-grok-night.XXXXXX") || exit 1
+done_count=0
+errors=0
+for repo in "${MERGE_LANE_REPOS[@]+"${MERGE_LANE_REPOS[@]}"}"; do
+    prs=$("$AGENT_PRS" "$repo" --draft-only 2>>"$OUT") || { echo "REVIEW: repo=$repo result=error reason=agent-prs failed" >> "$OUT"; errors=$((errors + 1)); continue; }
+    while IFS=$'\t' read -r number _branch _state _updated; do
+        [ -n "$number" ] || continue
+        [ "$done_count" -lt "$MAX" ] || { echo "REVIEW: repo=$repo pr=$number result=deferred reason=cap $MAX reached" >> "$OUT"; continue; }
+        [ $(( $(/bin/date +%s) - START )) -lt "$BUDGET" ] || { echo "REVIEW: repo=$repo pr=$number result=deferred reason=time budget ${BUDGET}s spent" >> "$OUT"; continue; }
+        "$REVIEW" "$repo" "$number" --post > "$OUT.res" 2>"$OUT.err" &
+        pid=$!
+        waited=0
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$REVIEW_CAP" ]; do
+            /bin/sleep 1; waited=$((waited + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            kill -TERM -- "-$pid" 2>/dev/null; /bin/sleep 2; kill -KILL -- "-$pid" 2>/dev/null
+            wait "$pid" 2>/dev/null
+            echo "REVIEW: repo=$repo pr=$number result=error reason=review killed at its ${REVIEW_CAP}s cap" >> "$OUT"
+            errors=$((errors + 1))
+            continue
+        fi
+        wait "$pid"
+        rc=$?
+        review_line=$(/usr/bin/grep '^CURSOR REVIEW:' "$OUT.res" | /usr/bin/tail -1)
+        # A review that did not reach the PR leaves pr-iterate-night nothing to answer: an error.
+        if [ "$rc" -ne 0 ] || [ -z "$review_line" ] || [[ "$review_line" == *"posted=failed"* ]]; then
+            posted=$(printf '%s' "$review_line" | /usr/bin/grep -o 'posted=[a-z]*')
+            echo "REVIEW: repo=$repo pr=$number result=error reason=cursor-review exit $rc${posted:+, $posted}" >> "$OUT"
+            /usr/bin/tail -5 "$OUT.err" | /usr/bin/sed 's/^/    /' >> "$OUT"
+            errors=$((errors + 1))
+        else
+            echo "REVIEW: ${review_line#CURSOR REVIEW: }" >> "$OUT"
+            done_count=$((done_count + 1))
+        fi
+    done <<< "$prs"
+done
+
+echo "REVIEW: grok reviewed=$done_count errors=$errors seconds=$(( $(/bin/date +%s) - START ))"
+/bin/cat "$OUT"
+/bin/rm -f "$OUT" "$OUT.err" "$OUT.res"
+
+# Any active repo outside the merge lane still gets the model's /review-pr.
+for repo in "${ACTIVE_REPOS[@]+"${ACTIVE_REPOS[@]}"}"; do
+    case " ${MERGE_LANE_REPOS[*]+"${MERGE_LANE_REPOS[*]}"} " in *" $repo "*) ;; *) exit 0 ;; esac
+done
+exit 10

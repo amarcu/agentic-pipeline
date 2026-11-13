@@ -1,0 +1,295 @@
+#!/usr/bin/python3
+"""focus-orphans - open issues a repo's current focus no longer asks for.
+
+Usage: focus-orphans <owner/repo> [--focus <path>] [--json]
+
+The read-only half of `plan-features` Step 4's reconcile. Closing an issue stops
+dispatch from working it and nothing else, so a retirement only counts once its
+reason is in `agent/FOCUS.md`; this lists the candidates that reconcile offers.
+
+It is a script and not prose for the reason `skills/unstick/scripts/agenda` is one: a
+model assembling this list by reading bodies files the same issue differently on
+two runs, and the human is then asked to retire work on a list that moves.
+
+Every open issue lands in one of three states, and only the middle one is
+offered for retirement:
+
+  TRACES       its `## Why now` quotes a line still listed under `## In play -
+               features` or `## In play - polish`, or its `<!-- plan-features
+               run:... focus:"..." -->` comment names the focus line now at the
+               top of FOCUS.md. The focus still asks for it.
+  ORPHAN       it carries one of those two references and neither matches any
+               more: the line it was cut from has left the focus. This is a
+               retirement candidate, whatever its labels - `approved` included,
+               which is the set `unstick` never surfaces.
+  UNTRACEABLE  it carries neither reference, so nothing here can say whether
+               the focus wants it. Issues filed by hand and by `propose-tasks`,
+               which cites a path and line and never a focus line, land here.
+               They are counted, never offered: a backlog predating the
+               template is not evidence that the work is unwanted, and offering
+               it would hand the human the whole repo.
+
+That split is the difference between a list a human can answer and a list they
+will wave through. When StarBonk's open Phase 0 issues were read this way, every
+one was untraceable - written before the template, under a `## Why (verified in
+the code)` heading - and none was a decision anyone had made twice.
+
+Without the pull request list there is no way to tell a worker's issue from an
+abandoned one, and retiring an issue a worker is building strands its branch
+(`work-on-task` then refuses the closed issue). So a failed pull request query
+withholds the orphans entirely: the run says so, exits 1, and reconcile has
+nothing to offer rather than something unsafe.
+
+An orphan is CLAIMED when an open pull request would close it - head branch
+`task/issue-<N>-` or `worktree-issue-<N>`, or a body saying `Closes #<N>`. That
+is repos.conf's own definition of an agent PR, the one dispatch counts. A
+claimed issue is listed and never offered: the pull request is the decision, and
+closing the issue under a running worker strands the branch.
+
+Comparison is on normalised text - lowercased, backticks and bold markers
+dropped, whitespace collapsed - so a line reflowed in the document still matches
+the issue that quoted it.
+
+Exit codes:
+  0  the list printed, possibly empty
+  1  the list printed, but a query failed - an ERROR line says which
+  2  usage, the repo is not in repos.conf's map, or it has no agent/FOCUS.md
+
+Read-only: `gh issue list`, `gh pr list`, and one read of FOCUS.md. No
+third-party modules and nothing past 3.9: /usr/bin/python3 is 3.9.6.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(
+    REPO_ROOT, "launchd-runtime", "repos.conf")
+GH = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+GH_TIMEOUT = 120
+ISSUE_LIMIT = 200
+
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+AGENT_BRANCH_RE = re.compile(r"^(?:task/issue-|worktree-issue-)(\d+)")
+CLOSES_RE = re.compile(r"\bCloses #(\d+)", re.IGNORECASE)
+FOCUS_MARKER_RE = re.compile(r"<!--\s*plan-features\s+run:\S+\s+focus:\"(.*?)\"\s*-->", re.S)
+WHY_NOW_RE = re.compile(r"^##\s+Why now\s*$(.*?)(?=^##\s|\Z)", re.M | re.S)
+IN_PLAY_RE = re.compile(r"^##\s+In play\b.*$", re.M)
+FOCUS_HEADING_RE = re.compile(r"^##\s+Focus\b.*$", re.M)
+HEADING_RE = re.compile(r"^##\s")
+
+
+class QueryError(Exception):
+    pass
+
+
+def normalise(text):
+    text = re.sub(r"<!--.*?-->", " ", text or "", flags=re.S)
+    text = text.replace("`", "").replace("*", "").replace("_", " ")
+    return re.sub(r"\s+", " ", text).strip().lower().rstrip(".")
+
+
+def gh_json(args):
+    if not os.path.exists(GH):
+        raise QueryError("gh not found at %s" % GH)
+    proc = subprocess.run([GH] + args, capture_output=True, text=True, timeout=GH_TIMEOUT)
+    if proc.returncode != 0:
+        raise QueryError((proc.stderr or proc.stdout or "").strip().split("\n")[0])
+    try:
+        return json.loads(proc.stdout or "[]")
+    except ValueError as exc:
+        raise QueryError("unreadable JSON from gh: %s" % exc)
+
+
+def repo_path(repo):
+    """The checkout repos.conf maps this repo to, or None. The map is the contract."""
+    if not os.path.isfile(REPOS_CONF):
+        return None
+    proc = subprocess.run(
+        ["/bin/bash", "-c", '. "$1" >/dev/null 2>&1 || exit 3\nget_repo_path "$2"',
+         "focus-orphans", REPOS_CONF, repo], capture_output=True, text=True)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def focus_lines(text):
+    """(the focus line, the In-play lines) from a FOCUS.md, normalised.
+
+    An In-play line is a top-level bullet under either In-play heading. The focus
+    line is the first prose line under `## Focus`, skipping the comment the
+    template leaves there.
+    """
+    lines = text.split("\n")
+    in_play, focus = [], ""
+    section = None
+    for line in lines:
+        if HEADING_RE.match(line):
+            if IN_PLAY_RE.match(line):
+                section = "in-play"
+            elif FOCUS_HEADING_RE.match(line):
+                section = "focus"
+            else:
+                section = None
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith("<!--"):
+            continue
+        if section == "in-play" and stripped.startswith("- "):
+            item = normalise(stripped[2:])
+            if item:
+                in_play.append(item)
+        elif section == "focus" and not focus:
+            focus = normalise(stripped)
+    return focus, in_play
+
+
+def classify(issue, focus, in_play):
+    """(state, why) for one issue: traces, orphan or untraceable."""
+    body = issue.get("body") or ""
+    marker = FOCUS_MARKER_RE.search(body)
+    why = WHY_NOW_RE.search(body)
+    if marker:
+        if focus and normalise(marker.group(1)) == focus:
+            return "traces", "its focus: comment names the current focus line"
+    if why:
+        quoted = normalise(why.group(1))
+        for item in in_play:
+            if item and item in quoted:
+                return "traces", "its Why now quotes an In-play line"
+    if marker:
+        return "orphan", "its focus: comment names a line that has left the focus"
+    if why:
+        return "orphan", "its Why now quotes no line still in play"
+    return "untraceable", "no Why now section and no focus: comment"
+
+
+def claims(prs):
+    """{issue number: PR number} for every open PR that would close an issue."""
+    out = {}
+    for pr in prs:
+        number = pr.get("number")
+        branch = AGENT_BRANCH_RE.match(pr.get("headRefName") or "")
+        if branch:
+            out.setdefault(int(branch.group(1)), number)
+        for match in CLOSES_RE.finditer(pr.get("body") or ""):
+            out.setdefault(int(match.group(1)), number)
+    return out
+
+
+def age_days(created):
+    try:
+        when = datetime.strptime((created or "")[:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        return None
+    return (datetime.now(timezone.utc) - when.replace(tzinfo=timezone.utc)).days
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("repo")
+    parser.add_argument("--focus")
+    parser.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        return 2
+    if not REPO_RE.match(args.repo):
+        print("focus-orphans: <owner/repo> expected, got %r" % args.repo, file=sys.stderr)
+        return 2
+
+    focus_path = args.focus
+    if not focus_path:
+        path = repo_path(args.repo)
+        if not path:
+            print("focus-orphans: %s is not in repos.conf's get_repo_path map" % args.repo,
+                  file=sys.stderr)
+            return 2
+        focus_path = os.path.join(path, "agent", "FOCUS.md")
+    if not os.path.isfile(focus_path):
+        print("focus-orphans: %s has no %s - direction is not written down, so nothing "
+              "can be judged against it" % (args.repo, focus_path), file=sys.stderr)
+        return 2
+
+    focus, in_play = focus_lines(open(focus_path, encoding="utf-8", errors="replace").read())
+
+    status = 0
+    errors = []
+    try:
+        issues = gh_json(["issue", "list", "--repo", args.repo, "--state", "open",
+                          "--limit", str(ISSUE_LIMIT),
+                          "--json", "number,title,body,labels,createdAt"])
+    except (QueryError, subprocess.SubprocessError) as exc:
+        print("ERROR: %s issues - %s" % (args.repo, exc))
+        return 1
+    try:
+        prs = gh_json(["pr", "list", "--repo", args.repo, "--state", "open",
+                       "--json", "number,headRefName,body"])
+    except (QueryError, subprocess.SubprocessError) as exc:
+        # Without the PR list an issue a worker is building looks unclaimed, and
+        # offering that for retirement is the one mistake here that costs work.
+        errors.append("%s pull requests - %s - no orphan is offered this run" % (args.repo, exc))
+        prs = None
+        status = 1
+    claimed = claims(prs or [])
+
+    orphans, untraceable = [], []
+    for issue in issues:
+        state, why = classify(issue, focus, in_play)
+        if state == "traces":
+            continue
+        entry = {
+            "number": issue.get("number"),
+            "title": issue.get("title") or "",
+            "labels": [label.get("name") for label in issue.get("labels") or []],
+            "age_days": age_days(issue.get("createdAt")),
+            "claimed_by": claimed.get(issue.get("number")),
+            "why": why,
+        }
+        if state == "orphan" and prs is None:
+            # Unknowable whether a worker holds it, so it is not a candidate.
+            entry["why"] = "%s; withheld: the pull request list could not be read" % why
+            untraceable.append(entry)
+            continue
+        (orphans if state == "orphan" else untraceable).append(entry)
+    orphans.sort(key=lambda o: o["number"])
+    untraceable.sort(key=lambda o: o["number"])
+
+    if args.json:
+        print(json.dumps({
+            "repo": args.repo, "focus": focus, "in_play": in_play,
+            "open_issues": len(issues), "orphans": orphans,
+            "untraceable": untraceable, "errors": errors,
+        }, indent=1))
+    else:
+        print("FOCUS: %s | %s" % (args.repo, focus or "(none stated)"))
+        if prs is None:
+            print("WITHHELD: the pull request list could not be read, so no orphan is "
+                  "offered - an issue a worker is building looks unclaimed without it")
+        for orphan in orphans:
+            print("ORPHAN: #%s | %s | age=%sd | claimed=%s | %s" % (
+                orphan["number"], ",".join(orphan["labels"]) or "-",
+                "?" if orphan["age_days"] is None else orphan["age_days"],
+                "#%s" % orphan["claimed_by"] if orphan["claimed_by"] else "-",
+                orphan["title"]))
+        if untraceable:
+            numbers = ", ".join("#%s" % o["number"] for o in untraceable[:8])
+            if len(untraceable) > 8:
+                numbers += " and %d more" % (len(untraceable) - 8)
+            print("UNTRACEABLE: %d | %s | no Why now and no focus: comment - "
+                  "counted, not offered" % (len(untraceable), numbers))
+        print("ORPHANS: %s open=%d orphans=%d claimed=%d untraceable=%d" % (
+            args.repo, len(issues), len(orphans),
+            sum(1 for o in orphans if o["claimed_by"]), len(untraceable)))
+        for error in errors:
+            print("ERROR: %s" % error)
+    return status
+
+
+if __name__ == "__main__":
+    sys.exit(main())

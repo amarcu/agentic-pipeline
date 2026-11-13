@@ -1,0 +1,126 @@
+#!/usr/bin/python3
+"""Print one FRICTION: line for rules that keep getting in the way, or nothing.
+
+Usage: friction <YYYY-MM-DD> [metrics-dir]
+
+Reads the two friction ledgers the runtime writes:
+
+  denials.jsonl        one row per command a routine's deny-net refused, from
+                       the run's JSON envelope (_run.sh). `ts` is the runner's
+                       local stamp -- "2026-09-13 04:02:11 UTC".
+  tool-failures.jsonl  one row per failed tool call, from the PostToolUseFailure
+                       hook (launchd-runtime/bin/record-tool-failure). `ts` is
+                       ISO-8601.
+
+Both timestamps start with YYYY-MM-DD, which is the whole matching rule.
+
+Friction is the same block -- same kind, routine, tool and input -- in two or
+more distinct runs within the seven days ending on the given date. One run
+hitting a rule is that run's business: it halts and says so. The same rule
+stopping the same routine run after run is either a rule that makes no sense
+or a skill reaching for something it should not, and either way the human
+decides; putting it in front of them is all this line is for.
+
+Silence is a valid answer, as for spend-today: absent ledgers and no repeat
+both print nothing and exit 0, and so does a line a killed writer left
+half-written. At most three are named, most runs first, and
+the count says how many there are. Output is written as UTF-8 bytes: under
+launchd there is no locale, and a print() of the separator would fail.
+"""
+import datetime
+import json
+import os
+import sys
+
+DEFAULT_METRICS_DIR = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "metrics")
+WINDOW_DAYS = 7
+NAMED = 3
+SAMPLE_CAP = 60
+LEDGERS = (("denied", "denials.jsonl"), ("failed", "tool-failures.jsonl"))
+
+
+def rows(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
+    except OSError:
+        return
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict):
+            yield row
+
+
+def sample(raw):
+    """What the block was about: the command or path, not the whole input."""
+    try:
+        value = json.loads(raw) if isinstance(raw, str) else raw
+    except ValueError:
+        value = raw
+    path = None
+    if isinstance(value, dict):
+        path = value.get("file_path") or value.get("path")
+        value = value.get("command") or path or json.dumps(value, sort_keys=True)
+    text = " ".join(str(value or "").split())
+    if len(text) <= SAMPLE_CAP:
+        return text
+    # A worktree path's common prefix fills the cap; the end names what failed.
+    if path and value == path:
+        return "…" + text[-(SAMPLE_CAP - 1):]
+    return text[:SAMPLE_CAP - 1] + "…"
+
+
+def clip(text):
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= SAMPLE_CAP else text[:SAMPLE_CAP - 1] + "…"
+
+
+def main():
+    if len(sys.argv) not in (2, 3):
+        sys.stderr.write("usage: friction <YYYY-MM-DD> [metrics-dir]\n")
+        return 2
+    try:
+        today = datetime.date.fromisoformat(sys.argv[1])
+    except ValueError:
+        sys.stderr.write("friction: not a date: %s\n" % sys.argv[1])
+        return 2
+    if len(sys.argv) == 3:
+        metrics_dir = sys.argv[2]
+    else:
+        metrics_dir = os.environ.get("METRICS_DIR") or DEFAULT_METRICS_DIR
+    first = (today - datetime.timedelta(days=WINDOW_DAYS - 1)).isoformat()
+    last = today.isoformat()
+
+    seen = {}
+    for kind, name in LEDGERS:
+        for row in rows(os.path.join(metrics_dir, name)):
+            stamp = str(row.get("ts") or "")
+            if not first <= stamp[:10] <= last:
+                continue
+            key = (kind, row.get("routine") or "-", row.get("tool") or "?", sample(row.get("input")))
+            entry = seen.setdefault(key, {"runs": set(), "latest": "", "error": ""})
+            entry["runs"].add(row.get("run_id") or row.get("session_id") or stamp)
+            if stamp >= entry["latest"]:
+                entry["latest"] = stamp
+                entry["error"] = clip(row.get("error"))
+
+    repeated = [(key, entry) for key, entry in seen.items() if len(entry["runs"]) >= 2]
+    if not repeated:
+        return 0
+    repeated.sort(key=lambda item: (len(item[1]["runs"]), item[1]["latest"]), reverse=True)
+    named = ['%s %s %s "%s" ×%d%s' % (key[0], key[1], key[2], key[3], len(entry["runs"]),
+                                      ": " + entry["error"] if entry["error"] else "")
+             for key, entry in repeated[:NAMED]]
+    more = len(repeated) - NAMED
+    line = "FRICTION: %d repeated in %d days — %s%s\n" % (
+        len(repeated), WINDOW_DAYS, "; ".join(named), " (+%d more)" % more if more > 0 else "")
+    sys.stdout.buffer.write(line.encode("utf-8"))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

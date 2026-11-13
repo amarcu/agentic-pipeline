@@ -1,0 +1,411 @@
+#!/usr/bin/python3
+"""PreToolUse hook on Bash: refuse commands that would destroy protected paths.
+
+Static permission rules match the command STRING. That leaves a gap this hook
+exists to close: `Bash(rm -rf /Users/.../trash)` can be denied while
+`cd /Users/... && rm -rf trash` matches no rule at all, because the second
+never mentions the protected path. This resolves what a command actually
+targets — following `cd`, `&&`, `;`, `||` and line breaks — and matches on the
+result.
+
+Contract (verified against the plugin-dev hook-development skill):
+  stdin   {"tool_input": {"command": "..."}, ...}
+  deny    {"hookSpecificOutput": {"permissionDecision": "deny"}, ...} on stderr, exit 2
+  allow   exit 0
+
+Failure policy is deliberately asymmetric. An internal error while analysing a
+command that looks destructive denies it — refusing a legitimate `rm` is a
+nuisance, allowing an unanalysed one is the failure this hook exists to
+prevent. An error on a command with no destructive verb allows it, so a bug
+here cannot brick every Bash call in the session.
+"""
+import fnmatch
+import json
+import os
+import re
+import shlex
+import sys
+
+CONF = os.environ.get("PROTECTED_ROOTS_CONF") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "protected-roots.conf"
+)
+LOCAL_CONF = os.environ.get("PROTECTED_ROOTS_LOCAL_CONF") or (
+    os.path.splitext(CONF)[0] + ".local.conf")
+
+# Verbs that remove, move or truncate. `git worktree remove` and `git clean`
+# are handled separately because the verb is the second/third token.
+DESTRUCTIVE = {"rm", "rmdir", "mv", "dd", "shred", "truncate", "unlink"}
+
+# Cheap substring prescreen. This hook runs on EVERY Bash call, so anything
+# that cannot possibly delete must cost one string scan and nothing more.
+MARKERS = ("rm", "mv", "dd", "shred", "truncate", "unlink", "clean", "worktree", ">")
+
+# A token made only of these separates commands: `;`, `&&`, `||`, `|`, `&`, a
+# line break, or a run of them such as `;` ending a line.
+SEPARATOR_CHARS = set(";&|\n")
+
+# `<<WORD`, `<<-WORD`, `<<'WORD'`, `<<"WORD"` or `<<\WORD`, but not a `<<<` here-string.
+HEREDOC = re.compile(r"(?<!<)<<(?!<)(-?)[ \t]*\\?(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\2")
+
+# A command that only writes a message: `cat` or `tee` to a file, `git commit`,
+# or `gh pr|issue|release|api`, taking one heredoc as its input or as a
+# "$(cat <<'EOF' …)" argument, with nothing after it. No shell reads that body,
+# so it is not checked as commands. Around the heredoc only plain words and
+# simple quoted strings may appear — no pipe, substitution, `!` or second
+# command — and the body may not hold its own delimiter line, where bash would
+# end it early and run the rest. Any other heredoc body is checked.
+_WORDS = r"""(?:[^\n'"`$\\|;&()<>!]|"[^\n"`$\\!]*"|'[^\n']*')*"""
+_PATH = r"""[^\s'"`$\\|;&()<>!]+"""
+_REDIRECT = r"(?:>>?[ \t]*" + _PATH + r")?"
+_CD = r"(?:cd[ \t]+" + _PATH + r"[ \t]*&&[ \t]*)?"
+_OPEN = r"<<-?[ \t]*(?P<q>['\"]?)(?P<delim>[A-Za-z_][A-Za-z0-9_]*)(?P=q)"
+_BODY = r"(?P<body>(?:(?![ \t]*(?P=delim)[ \t]*(?:\n|\Z))[^\n]*\n)*)"
+_END = r"(?P<end>[ \t]*(?P=delim)[ \t]*(?:\n|\Z))"
+MESSAGE_AS_INPUT = re.compile(
+    r"\A[ \t]*" + _CD + r"(?:cat|tee|git[ \t]+commit|gh[ \t]+(?:pr|issue|release|api))(?=[ \t<>])"
+    + _WORDS + _REDIRECT + _WORDS + _OPEN + _WORDS + _REDIRECT + _WORDS + r"\n"
+    + _BODY + _END + r"\s*\Z")
+MESSAGE_AS_ARGUMENT = re.compile(
+    r"\A[ \t]*" + _CD + r"(?:git[ \t]+commit|gh[ \t]+(?:pr|issue|release|api))(?=[ \t])"
+    + _WORDS + r'"\$\(cat[ \t]+' + _OPEN + r"[ \t]*\n"
+    + _BODY + _END + r'[ \t]*\)"' + _WORDS + r"\s*\Z")
+
+
+def load_roots():
+    """Protected roots and filename globs from the conf file.
+
+    Roots are put through the same symlink resolution as command targets. They
+    must be, or the comparison is between two different spellings of one path
+    and silently never matches: on macOS /tmp is a symlink to /private/tmp, so
+    a root written as /tmp/x never matches a target that resolved to
+    /private/tmp/x. A protection that quietly stops protecting is worse than
+    none, because nothing reports it.
+    """
+    roots, globs = [], []
+    # The local file is optional and can only add: a machine whose state does
+    # not live under the tracked defaults names its own paths there.
+    for path, required in ((CONF, True), (LOCAL_CONF, False)):
+        if not required and not os.path.isfile(path):
+            continue
+        with open(path) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line:
+                    continue
+                if "*" in line or "?" in line:
+                    globs.append(os.path.expanduser(line))
+                else:
+                    roots.append(resolve(line, os.sep))
+    return roots, globs
+
+
+def resolve(target, cwd):
+    """Absolute, normalised path for a command argument, without requiring it to exist."""
+    target = os.path.expanduser(target)
+    if not os.path.isabs(target):
+        target = os.path.join(cwd, target)
+    target = os.path.normpath(target)
+    # Resolve symlinks on the deepest existing ancestor, so a symlinked parent
+    # cannot be used to reach a protected path under another name.
+    probe = target
+    while probe != os.path.dirname(probe):
+        if os.path.exists(probe):
+            resolved = os.path.realpath(probe)
+            return os.path.normpath(os.path.join(resolved, os.path.relpath(target, probe)))
+        probe = os.path.dirname(probe)
+    return target
+
+
+def violates(path, roots, globs):
+    for root in roots:
+        # Under a protected root, the root itself, or a PARENT of it — removing
+        # a parent destroys the protected path just as completely.
+        if path == root or path.startswith(root + os.sep) or root.startswith(path + os.sep):
+            return root
+    base = os.path.basename(path)
+    for pattern in globs:
+        if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(base, pattern):
+            return pattern
+    return None
+
+
+def segments(tokens):
+    """Split a token stream into command segments on shell separators."""
+    out, current = [], []
+    for tok in tokens:
+        if tok and set(tok) <= SEPARATOR_CHARS:
+            if current:
+                out.append(current)
+            current = []
+        else:
+            current.append(tok)
+    if current:
+        out.append(current)
+    return out
+
+
+def lexer(text):
+    """shlex over `text`, reading a line break as a command separator.
+
+    shlex counts a line break as whitespace, so `echo hi` and `rm -rf x` on two
+    lines were one segment whose verb was `echo`, and the delete went unchecked.
+    A comment swallows the line break that ends it, so every break is doubled to
+    leave one behind; a backslash-newline joins two lines, as it does in bash.
+    """
+    text = text.replace("\\\n", "").replace("\n", "\n\n")
+    # shlex keeps quoted paths with spaces intact and drops comments.
+    lx = shlex.shlex(text, posix=True, punctuation_chars="();<>|&\n")
+    lx.whitespace = " \t\r"
+    lx.whitespace_split = True
+    return lx
+
+
+def tokenize(text):
+    return list(lexer(text))
+
+
+def tokens_before_failure(text):
+    """The words shlex reads on one line before an unclosed quote stops it.
+
+    For bash the rest of that line is inside the quote, so these are the only
+    words on it that could run.
+    """
+    out = []
+    try:
+        for tok in lexer(text):
+            out.append(tok)
+    except ValueError:
+        pass
+    return out
+
+
+def split_heredocs(command):
+    """(code, bodies): the command's lines outside every heredoc body, and each body.
+
+    Read a line at a time, as bash reads a heredoc: a body starts on the line
+    after its operator and ends at a line holding only its delimiter. Quotes
+    around an operator are not modelled, so `<<WORD` inside a string opens a
+    body too; the lines that takes out of the code are still checked, as a body.
+    """
+    code, bodies = [], []
+    lines = command.split("\n")
+    i = 0
+    while i < len(lines):
+        code.append(lines[i])
+        operators = HEREDOC.finditer(lines[i])
+        i += 1
+        for m in operators:
+            strip_tabs, delimiter = m.group(1) == "-", m.group(3)
+            body = []
+            while i < len(lines):
+                line = lines[i]
+                i += 1
+                if (line.lstrip("\t") if strip_tabs else line) == delimiter:
+                    break
+                body.append(line)
+            bodies.append("\n".join(body))
+    return "\n".join(code), bodies
+
+
+def targets_of(seg):
+    """The paths a segment would destroy, or [] if it destroys nothing."""
+    if not seg:
+        return []
+    verb = os.path.basename(seg[0])
+    args = seg[1:]
+
+    if verb == "git":
+        rest = [a for a in args if not a.startswith("-")]
+        # `git worktree remove <path>` and `git clean` both delete files.
+        if rest[:2] == ["worktree", "remove"]:
+            return rest[2:]
+        if rest[:1] == ["clean"]:
+            # Cannot know the targets without running it; treat cwd as at risk.
+            return ["."]
+        return []
+
+    if verb in DESTRUCTIVE:
+        # `mv a b` destroys b; every non-flag operand is a candidate either way.
+        return [a for a in args if not a.startswith("-")]
+
+    return []
+
+
+def contents_at_risk(seg):
+    """Paths that a command would destroy INSIDE a directory it removes wholesale.
+
+    `git worktree remove` is the case that matters. A worktree reporting clean
+    under `git status --untracked-files=all` still holds gitignored files, and
+    those exist nowhere else — a live server/.env at 2,314 bytes is what
+    prompted this. The worktree path itself is not protected, so matching on it
+    alone allows the removal; the credentials inside it are what must be seen.
+    """
+    if not seg or os.path.basename(seg[0]) != "git":
+        return []
+    rest = [a for a in seg[1:] if not a.startswith("-")]
+    if rest[:2] != ["worktree", "remove"] or len(rest) < 3:
+        return []
+    return rest[2:]
+
+
+def scan_for_protected(root, globs, limit=20000):
+    """Files under `root` matching a protected pattern. Bounded, and skips
+    dependency trees — node_modules holds .env samples by the thousand and is
+    regenerable, so walking it would be slow and would produce false positives."""
+    if not os.path.isdir(root):
+        return []
+    skip = {"node_modules", ".git", "vendor", "target", "dist", "build", ".next", "__pycache__"}
+    found, seen = [], 0
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip]
+        for name in filenames:
+            seen += 1
+            if seen > limit:
+                return found
+            if any(fnmatch.fnmatch(name, pat) for pat in globs):
+                found.append(os.path.join(dirpath, name))
+    return found
+
+
+def redirect_targets(tokens):
+    """`> path` truncates. `>>` appends and is left alone."""
+    out = []
+    for i, tok in enumerate(tokens):
+        if tok == ">" and i + 1 < len(tokens):
+            out.append(tokens[i + 1])
+    return out
+
+
+def check(tokens, cwds, roots, globs, seen):
+    """Deny if any segment of `tokens` would destroy a protected path.
+
+    A relative target is judged from every directory in `cwds`. Each directory a
+    `cd` leads to is added to `seen`. Returns the directories the tokens end in.
+    """
+    for seg in segments(tokens):
+        if seg and os.path.basename(seg[0]) == "cd" and len(seg) > 1:
+            cwds = [resolve(seg[1], cwd) for cwd in cwds]
+            seen.extend(cwds)
+            continue
+        for cwd in cwds:
+            for target in targets_of(seg) + redirect_targets(seg):
+                if any(ch in target for ch in "*?["):
+                    # A glob's expansion is unknown here; judge its directory,
+                    # which is what a wildcard would sweep.
+                    target = os.path.dirname(target) or "."
+                path = resolve(target, cwd)
+                hit = violates(path, roots, globs)
+                if hit:
+                    deny(
+                        f"Refused: this command would destroy a protected path.\n"
+                        f"  resolved target: {path}\n"
+                        f"  protected by:    {hit}\n"
+                        f"See permissions/protected-roots.conf. If this is genuinely "
+                        f"intended, a human must do it — do not work around this."
+                    )
+
+            # Removing a directory wholesale takes its contents with it, and the
+            # contents are what is unrecoverable — gitignored credentials do not
+            # show up in the path being removed.
+            for target in contents_at_risk(seg):
+                root = resolve(target, cwd)
+                found = scan_for_protected(root, globs)
+                if found:
+                    listed = "\n".join(f"    {p}" for p in found[:5])
+                    more = f"\n    ...and {len(found) - 5} more" if len(found) > 5 else ""
+                    deny(
+                        f"Refused: removing {root} would destroy files that exist "
+                        f"nowhere else.\n{listed}{more}\n"
+                        f"These are gitignored, so `git status` reports the tree clean "
+                        f"and `git worktree remove` would not warn. Move them out first, "
+                        f"or have a human confirm they are disposable."
+                    )
+    return cwds
+
+
+def scan_text(command):
+    """`command` without the redirects that appear everywhere and destroy nothing."""
+    for noise in ("2>/dev/null", "&>/dev/null", ">/dev/null", "2>&1", ">>"):
+        command = command.replace(noise, "")
+    return command
+
+
+def deny(reason):
+    sys.stderr.write(json.dumps({
+        "hookSpecificOutput": {
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        },
+        "systemMessage": reason,
+    }))
+    sys.exit(2)
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw)
+        command = payload.get("tool_input", {}).get("command", "")
+        # The command runs in the session's directory, not the hook's, so a
+        # relative target resolves against `cwd` from the payload.
+        start_cwd = payload.get("cwd") or os.getcwd()
+    except (ValueError, AttributeError):
+        sys.exit(0)  # Not a shape we understand; not our business to block.
+    # /dev/null redirects and 2>&1 appear on a large share of commands and can
+    # never destroy anything; drop them before the marker scan so they do not
+    # drag every such call through the parser.
+    scan = scan_text(command)
+    if not any(m in scan for m in MARKERS):
+        sys.exit(0)
+
+    looks_destructive = any(m in scan for m in MARKERS if m != ">")
+    try:
+        roots, globs = load_roots()
+        if not roots and not globs:
+            deny("protected-roots.conf is empty or unreadable; refusing to run "
+                 "a possibly destructive command with no protection list.")
+
+        message = MESSAGE_AS_INPUT.match(command) or MESSAGE_AS_ARGUMENT.match(command)
+        if message:
+            # The body is a message, not commands; what remains is still checked,
+            # such as a redirect onto a protected file.
+            command = command[:message.start("body")] + command[message.end("end"):]
+
+        try:
+            tokens = tokenize(command)
+        except ValueError:
+            tokens = None
+        if tokens is not None:
+            check(tokens, [start_cwd], roots, globs, [])
+        else:
+            # shlex has no notion of a heredoc. It reads a body as shell words, so
+            # an apostrophe in prose is an unclosed quote, and a command that
+            # writes a message was refused as unanalysable (issue #58). Parse the
+            # command without its heredoc bodies instead; if that fails too, the
+            # failure policy below judges the whole command, as it always has.
+            # Each body is then checked on its own, because a body fed to a shell
+            # can hold the very delete this hook exists to see.
+            code, bodies = split_heredocs(command)
+            seen = [start_cwd]
+            check(tokenize(code), [start_cwd], roots, globs, seen)
+            for body in bodies:
+                try:
+                    lines = [tokenize(body)]
+                except ValueError:
+                    lines = [tokens_before_failure(line) for line in body.split("\n")]
+                cwds = list(dict.fromkeys(seen))
+                for line_tokens in lines:
+                    cwds = check(line_tokens, cwds, roots, globs, [])
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - see the failure policy in the docstring
+        if looks_destructive:
+            deny(f"Refused: could not analyse this command safely ({exc.__class__.__name__}). "
+                 f"A command that may delete is denied when it cannot be checked.")
+        sys.exit(0)
+
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

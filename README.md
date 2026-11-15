@@ -27,7 +27,10 @@ flowchart TD
 Three rules hold the loop together:
 
 - **A human decides what gets built.** An agent acts only on an issue that carries the `approved`
-  label. The owner applies it, or a standing rule does for issues cut from the owner's written plan.
+  label. The owner applies it, with one exception the repo itself has to grant: a repo whose
+  `agent/FOCUS.md` carries the line `refill-queue: approve` lets [`refill-queue`](./skills/refill-queue/)
+  approve an issue that quotes one of that file's In-play lines verbatim and touches nothing on the
+  repo's ask-first list. The line the owner wrote is the approval.
 - **The repo decides what "done" means.** Each repo's `CLAUDE.md` names one verify command. The
   agent runs it and reports one of four outcomes; it never edits a test to make it pass.
 - **No unattended run can merge.** `gh pr merge` and `gh pr ready` are denied to every headless run
@@ -41,12 +44,12 @@ not counted.
 
 | Figure | Value | As of | Source |
 |---|---|---|---|
-| Decided agent PRs that were merged | 73 of 75 (97.3%) | 2026-11-11 | `make funnel` |
+| Decided agent PRs that were merged | 73 of 75 (97.3%) | 2026-11-15 | `make funnel` |
 | The same figure at the first assessment | 36 of 37 (97.3%) | 2026-07-14 | [assessment](./docs/assessments/2026-07-14-skill-efficiency-assessment.md) |
-| Decided proposals that the owner approved | 115 of 150 (76.7%) | 2026-11-11 | `make funnel` |
+| Decided proposals that the owner approved | 115 of 150 (76.7%) | 2026-11-15 | `make funnel` |
 | Cost per merged PR, all routines included | $8.36 ($83.63 over 10 PRs in 30 days) | 2026-07-14 | assessment, `make cost` |
-| Reviewed agent PRs that passed every review first time, pilot repo | 4 of 16 | 2026-11-12 | `make review-rollup` |
-| Regression tests | 492, hermetic, no network | 2026-11-13 | `make test` |
+| Reviewed agent PRs that passed every review first time, pilot repo | 4 of 16 | 2026-11-15 | `make review-rollup` |
+| Regression tests | 510, hermetic, no network | 2026-11-15 | `make test` |
 
 The July assessment gives its own caveat: the sample is small, and the numbers are a baseline for a
 trend, not a verdict. The cost figure has not been re-measured since.
@@ -72,6 +75,13 @@ trend, not a verdict. The cost figure has not been re-measured since.
   Claude. Other repos get [`review-pr`](./skills/review-pr/). In its first two rounds on its own
   code the Cursor lane raised six findings; all six were valid
   ([assessment](./docs/assessments/2026-09-08-cursor-review-lane.md)).
+- **An attack on the plan, before the build.** [`plan-attack`](./launchd-runtime/bin/plan-attack)
+  hands an issue's implementation plan and acceptance criteria, with the source tree at the base
+  branch, to the same non-Anthropic model and asks only for what will go wrong: a step that cannot
+  work in this code, a criterion no step satisfies, a path that does not exist. It is run by hand
+  on an issue before approval; nothing on the schedule calls it yet. Replayed on 2026-11-14
+  against one issue whose pull request went three review rounds without a pass, it raised from the
+  plan alone the finding that stayed open through all three.
 - **An eval for the reviewer.** [`tests/evals/review-pr/`](./launchd-runtime/tests/evals/review-pr/)
   plants a one-character boundary bug that the repo's own tests pass, then measures whether the
   reviewer catches it and whether it invents findings on the clean case.
@@ -87,7 +97,7 @@ leaves rows behind, and the evening digest reads them back.
 | What is recorded | Where | Read by |
 |---|---|---|
 | One row per routine run: exit code, duration, cost, or the reason it skipped | `runs.jsonl` | `make cost` |
-| Every completed tool call: the tool, how long it took, a short label (never its output) | `tool-calls.jsonl`, from a `PostToolUse` hook | `make trace` |
+| Every completed tool call: the tool, how long it took, a short label (never its output) | `tool-calls.jsonl`, from a `PostToolUse` hook | `make trace`, `make item` |
 | Failed tool calls | `tool-failures.jsonl`, from a `PostToolUseFailure` hook | `make trace`, the friction line |
 | Each command the deny-net refused | `denials.jsonl` | the friction line |
 | Every Telegram message sent through the sender | `sends.jsonl` | `routine-cost --sends` |
@@ -117,6 +127,12 @@ The ledgers cover headless runs; of an interactive session only its Telegram sen
 Spend is recorded per routine, so cost per merged PR is a division over a window, not a per-PR
 measurement.
 
+**One item, end to end.** [`item-trace`](./launchd-runtime/bin/item-trace) joins GitHub's timestamps with those
+ledgers and prints, for one issue or for every issue in a repo, how long it waited for approval, how long it sat in
+the queue, how long review took and in how many rounds, how long the worker spent on it, and an estimate of what it
+cost. A dispatch run works several issues in one model session with one reported cost, so the per-item figure is that
+run's spend shared in proportion to worker time. It is printed as an estimate everywhere it appears.
+
 ## Where it failed, and what changed
 
 | When | What happened | What changed |
@@ -127,6 +143,7 @@ measurement.
 | 2026-09 (week 37) | All 55 scheduled runs exited 0, and one pull request came out. The pipeline was reliable and almost idle. | The [audit](./docs/assessments/2026-09-13-week-37-pipeline-audit.md) named what the pipeline was waiting on. Spend is now recorded for every routine; it was two of nine. |
 | 2026-09 | Author, reviewer and gate were the same model on the same account. | The Cursor review lane above. |
 | 2026-11-12 | The digest's skill listed three ledger commands and the model ran one. Two lines were missing with nothing to say why. | The step-level trace showed it the next morning. The step is now one command. |
+| 2026-10-20 and 2026-11-11 | The one active repo ran out of approved issues twice, for 15 days and then 4, with In-play lines nobody had cut: issues were only ever cut in a live planning session. | `refill-queue` cuts the next issues from the focus file each night the queue is low, and halts when the lines run out. |
 
 Each past bug class is encoded as a permanent test.
 
@@ -143,6 +160,7 @@ mechanical part is checked by a static test. All of them inherit one set of beha
 |---|---|---|
 | [`propose-tasks`](./skills/propose-tasks/) | Surveys a repo with no human-led direction and cuts at most two `proposed` chore issues. | scheduled |
 | [`plan-features`](./skills/plan-features/) | The design conversation for one repo: reviews what shipped, updates the direction documents with the owner, cuts the week's issues. | interactive |
+| [`refill-queue`](./skills/refill-queue/) | Cuts the next issues from a human-led repo's In-play lines when its approved queue runs low; approves them only where that repo's focus file allows it. | scheduled |
 | [`dispatch-tasks`](./skills/dispatch-tasks/) | Sends `approved` issues to `work-on-task` one at a time, bounded by how many agent PRs already await review. | scheduled |
 | [`work-on-task`](./skills/work-on-task/) | Implements one approved issue in a worktree, runs the verify gate, opens a draft PR. | called by dispatch |
 | [`review-pr`](./skills/review-pr/) | Reviews one PR against the issue's acceptance criteria and the real gate; posts inline threads and a machine-readable verdict. | scheduled |
@@ -180,7 +198,7 @@ One LaunchAgent per routine. Times are local to the pipeline host.
 ```
 04:00  wake-status-digest     health check of yesterday's routines
 04:02  morning-triage         classify open work across the active repos
-04:05  morning-proposals      chore proposals, capped per repo and overall
+04:05  morning-proposals      chore proposals, and the refill of human-led repos, capped per repo and overall
 04:10  dispatch-tasks-night   approved issues become draft PRs
 04:20  skill-assess-weekly    Mondays: audit this repo's own skills
 05:00  pr-review-night        review of open agent PRs (second vendor's model on merge-lane repos)
@@ -251,7 +269,7 @@ an e-mail address or a key.
 ## Repo layout
 
 ```
-skills/<name>/          one folder per skill (16): SKILL.md, META.md, references/, scripts/
+skills/<name>/          one folder per skill (17): SKILL.md, META.md, references/, scripts/
 _templates/             skeleton for a new skill
 BASELINE.md             behavioural rules every skill inherits
 BASELINE-CODING.md      verify-gate rules, retry budget, when to stop and ask
@@ -279,6 +297,7 @@ make funnel           # proposal, approval, PR and merge rates
 make review-rollup    # review rounds, clean passes and findings per repo
 make cost             # spend per routine, last 7 days
 make doctor           # can this host build these projects?
+make item REPO=owner/name   # one item's time in each stage; ISSUE=<n> for one timeline
 ```
 
 Full reference: [`launchd-runtime/COMMANDS.md`](./launchd-runtime/COMMANDS.md). Architecture and the

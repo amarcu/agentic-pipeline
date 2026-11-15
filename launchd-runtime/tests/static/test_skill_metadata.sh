@@ -3,7 +3,8 @@
 
 ALL_SKILLS=(notify request-approval triage-repo morning-triage
             propose-tasks plan-features dispatch-tasks work-on-task
-            iterate-on-pr daily-summary skill-assess review-pr)
+            iterate-on-pr daily-summary skill-assess review-pr
+            refill-queue)
 
 test_every_skill_has_skill_md() {
     local rc=0

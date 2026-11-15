@@ -84,12 +84,13 @@ case "${1:-}" in
         ;;
     api)
         case "${2:-}" in
-            repos/*/pulls\?*|repos/*/pulls/*/reviews\?*|repos/*/pulls/*/comments\?*|repos/*/issues/*/comments\?*)
-                # review-rollup's reads: a query string on the path, and one
-                # file per pull request, because the rollup compares PRs with
-                # different review histories in one run. A PR with no file has
-                # no reviews or comments, which GitHub answers with an empty
-                # list and not a 404; the pulls listing itself has to exist.
+            repos/*/pulls\?*|repos/*/pulls/*/reviews\?*|repos/*/pulls/*/comments\?*|repos/*/issues/*/comments\?*|repos/*/issues\?*|repos/*/issues/*/events\?*)
+                # review-rollup's and item-trace's reads: a query string on the
+                # path, and one file per pull request or issue, because both
+                # compare items with different histories in one run. An item
+                # with no file has no reviews, comments or events, which GitHub
+                # answers with an empty list and not a 404; the pulls and
+                # issues listings themselves have to exist.
                 # --slurp wraps the page in an array, as real gh does.
                 path="${2%%\?*}"
                 rest="${path#repos/}"
@@ -100,11 +101,13 @@ case "${1:-}" in
                     */pulls/*/reviews)   n="${path%/reviews}";  file="$dir/reviews-${n##*/}.json" ;;
                     */pulls/*/comments)  n="${path%/comments}"; file="$dir/review-comments-${n##*/}.json" ;;
                     */issues/*/comments) n="${path%/comments}"; file="$dir/issue-comments-${n##*/}.json" ;;
+                    */issues/*/events)   n="${path%/events}";   file="$dir/issue-events-${n##*/}.json" ;;
+                    */issues)            file="$dir/issues.json" ;;
                 esac
                 slurp=0
                 for a in "$@"; do [[ "$a" == "--slurp" ]] && slurp=1; done
                 if [[ ! -f "$file" ]]; then
-                    if [[ "$path" == */pulls ]]; then
+                    if [[ "$path" == */pulls || "$path" == */issues ]]; then
                         echo "gh: Not Found (HTTP 404)" >&2
                         exit 1
                     fi

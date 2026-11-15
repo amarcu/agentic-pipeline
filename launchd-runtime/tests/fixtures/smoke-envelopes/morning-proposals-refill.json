@@ -1,0 +1,6 @@
+{"type":"result","subtype":"success","is_error":false,"num_turns":14,
+ "total_cost_usd":0.9120,"session_id":"smoke-fixture-refill",
+ "permission_denials":[],
+ "result":"The one active repo's direction is human-led and its queue was empty, so the refill planned two issues from its focus under ROUTINE_DRY_RUN=1. Nothing was created and no digest was sent.\n\nPLANNED: acme/game#- | shape:feature | size:M | approved:yes | Add a second enemy type\nPLANNED: acme/game#- | shape:polish | size:S | approved:no | Restore the time scale on restart",
+ "modelUsage":{"claude-opus-4-8":{"inputTokens":21,"outputTokens":2410,
+  "cacheReadInputTokens":90344,"cacheCreationInputTokens":14010}}}

@@ -10,7 +10,7 @@
 # printed in an earlier turn, or inside a sentence, is a line nobody can read
 # (#52). tests/static/test_routine_contracts.sh keeps this in step with prompts/.
 morning-triage	TRIAGE:
-morning-proposals	PROPOSED:|HALT:
+morning-proposals	PROPOSED:|PLANNED:|HALT:
 dispatch-tasks-night	DISPATCH GATE:
 dispatch-tasks-night	DISPATCH END:
 pr-review-night	REVIEW:

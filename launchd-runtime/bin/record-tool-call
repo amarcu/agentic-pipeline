@@ -15,7 +15,9 @@ tool_response, tool_use_id, duration_ms, session_id, prompt_id and cwd. A
 failed call does not arrive here: it goes to PostToolUseFailure.
 
 The row keeps the tool, how long it took, and a short label for what it was
-asked: a command's first line, a path's end, a skill's name. It never keeps
+asked: a command's first line, a path's end, a skill's name and arguments.
+The arguments are what ties a run to the issue it worked on: bin/item-trace
+reads `work-on-task 97 --repo owner/name` back out of this label. It never keeps
 tool_response, and it caps the label, because a ledger of everything a routine
 read and printed would be a second copy of every repo's contents.
 
@@ -45,6 +47,8 @@ def label(tool, tool_input):
     if not field or not isinstance(tool_input, dict):
         return ""
     value = str(tool_input.get(field) or "").split("\n", 1)[0]
+    if tool == "Skill" and tool_input.get("args"):
+        value = "%s %s" % (value, str(tool_input["args"]).split("\n", 1)[0])
     if field in PATH_FIELDS:
         return value[-LABEL_CAP:]   # the end of a path names the file
     return value[:LABEL_CAP]

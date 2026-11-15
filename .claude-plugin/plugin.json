@@ -23,6 +23,7 @@
     "./skills/notify",
     "./skills/plan-features",
     "./skills/propose-tasks",
+    "./skills/refill-queue",
     "./skills/request-approval",
     "./skills/review-pr",
     "./skills/skill-assess",

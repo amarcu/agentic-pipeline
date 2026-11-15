@@ -1,0 +1,340 @@
+#!/usr/bin/python3
+"""plan-attack - have a non-Claude model attack one issue's plan before anyone builds it.
+
+Usage: plan-attack <owner/repo> <issue> [--model <id>] [--ref <commit>] [--dry-run] [--json] [--keep]
+
+The pipeline reviews a pull request with a second vendor's model and reviews
+nothing before that. A flaw in the plan is therefore found after the worker
+has spent a run building it, in review, where it costs a round. StarBonk #84
+merged after three rounds that never passed; the first thing wrong with it was
+in the issue.
+
+This reads the issue's `## Implementation plan` and `## Acceptance criteria`
+and hands them, with the source tree at the repo's base branch, to a reviewer
+whose only job is to break the plan: a step that cannot work in this code, a
+criterion the plan never satisfies, a criterion nobody could test, a path that
+does not exist. It reports; it changes nothing, on GitHub or on disk.
+
+It is run by hand for now, on an issue before it is approved. Nothing on the
+schedule calls it.
+
+The three rules are cursor-review's, kept for the same reasons:
+
+  1. The model must not be an Anthropic one. Claude wrote the plan; a Claude
+     attacker shares its priors. An id matching CLAUDE_MODEL_RE is refused
+     before anything is built or sent.
+  2. `--mode ask` only. The attacker reads and reasons; it never edits. `--trust`
+     is passed because cursor-agent refuses a directory it has not seen, and
+     every workspace here is new. It grants the workspace, not the right to
+     change it; `--force` and `--yolo` are never passed.
+  3. The API key reaches cursor-agent in its environment only: never in an
+     argument, never printed. CURSOR_API_KEY, else the first line of
+     CURSOR_API_KEY_FILE (default ~/.config/cursor/api-key), which is refused
+     when group- or world-readable.
+
+The attacker works in a throwaway directory holding the issue and a
+`git archive` of the base branch, never in the checkout, so trusting the
+workspace trusts nothing that persists. --keep leaves it in place and prints
+where; --dry-run builds it, prints the prompt's size and stops before
+cursor-agent is called. --ref attacks the plan against a named commit in place
+of the base branch, which is how a plan that has since been built is replayed
+against the code as it was.
+
+The last line of output is the one to parse:
+
+  PLAN ATTACK: repo=<owner/repo> issue=<N> model=<id> verdict=<clean|findings> findings=<must>/<should> base=<sha7>
+
+Exit codes:
+  0  attacked: the verdict line says clean or findings
+  1  a git or gh read failed
+  2  usage, the repo is not in repos.conf's map, or cursor-agent is missing
+  4  the issue has no plan or no acceptance criteria: nothing to attack
+  5  no usable API key
+  6  the model is an Anthropic one
+  8  cursor-agent failed, or its answer carried no verdict that could be read
+
+No third-party modules and nothing past 3.9: /usr/bin/python3 is 3.9.6.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+REPOS_CONF = os.environ.get("REPOS_CONF") or os.path.join(HERE, "..", "repos.conf")
+DEFAULT_MODEL = "cursor-grok-4.6-high"
+CLAUDE_MODEL_RE = re.compile(r"claude|anthropic|opus|sonnet|haiku|fable", re.I)
+REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+SECTION_RE = r"^##\s+%s\b.*?$(.*?)(?=^##\s|\Z)"
+SEVERITIES = ("must", "should")
+MAX_FINDINGS = 5
+AGENT_TIMEOUT = 900
+
+PROMPT = """You are reviewing a PLAN, not code. Your only job is to attack it.
+
+In this workspace:
+  issue.md   one GitHub issue: its goal, an implementation plan and acceptance criteria
+  src/       the repository's source tree at the branch the work will start from
+
+Nothing has been built yet. Find what will go wrong if a competent engineer follows this plan
+exactly. Check the plan against src/, not against what you assume the code looks like.
+
+Raise a finding only for one of these, and only when you can point at evidence:
+  - a plan step that cannot work in this code as it is (name the file and line that shows it)
+  - a path, type, function or asset the plan names that does not exist in src/
+  - an acceptance criterion that no plan step satisfies
+  - an acceptance criterion nobody could test as written
+  - two steps, or a step and a criterion, that contradict each other
+  - a case the plan's approach handles wrongly (state the concrete input and the wrong result)
+
+Do not raise: style, naming, things you would have designed differently, missing features the
+issue does not ask for, or risks that need an attacker with access to the machine. The plan is
+advisory and short on purpose; brevity is not a finding.
+
+Severity: "must" if following the plan produces something that fails a stated criterion or
+cannot be built; "should" if it will probably cost a review round. At most %d findings; keep the
+ones that would cost the most.
+
+You cannot edit anything and must not try. Answer with one JSON object and nothing after it:
+
+{"verdict": "clean" | "findings",
+ "findings": [{"id": "a1", "severity": "must" | "should",
+               "target": "<plan step N | criterion N>",
+               "claim": "<what goes wrong, one or two sentences>",
+               "evidence": "<src/path:line, or the quoted words of the plan>",
+               "settles": "<the change to the plan or criterion that would close this>"}]}
+
+"clean" means you looked and found nothing of the kinds above; its findings list is empty.
+""" % MAX_FINDINGS
+
+
+def die(code, message):
+    sys.stderr.write("plan-attack: %s\n" % message)
+    sys.exit(code)
+
+
+def conf(function, repo):
+    """One of repos.conf's lookups. The map is the contract; nothing is searched for."""
+    if not os.path.isfile(REPOS_CONF):
+        return ""
+    proc = subprocess.run(
+        ["/bin/bash", "-c", '. "$1" >/dev/null 2>&1 || exit 3\n"$2" "$3"',
+         "plan-attack", REPOS_CONF, function, repo], capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else ""
+
+
+def api_key():
+    key = os.environ.get("CURSOR_API_KEY") or ""
+    if key:
+        return key
+    path = os.environ.get("CURSOR_API_KEY_FILE") or os.path.expanduser("~/.config/cursor/api-key")
+    if not os.path.isfile(path):
+        die(5, "no API key: CURSOR_API_KEY is unset and %s does not exist" % path)
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        die(5, "%s is mode %o, group- or world-readable; chmod 600 it" % (path, mode))
+    with open(path) as f:
+        key = "".join(f.readline().split())
+    if not key:
+        die(5, "%s is empty" % path)
+    return key
+
+
+def objects(text):
+    """Every self-contained {...} run in `text`, in order.
+
+    The answer arrives after the model's narration, so the object is found, not
+    assumed to be the whole string. Braces inside strings are skipped, so a
+    claim that quotes one cannot cut the object short.
+    """
+    found, depth, start, in_string, escaped = [], 0, None, False, False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"' and depth:
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+            if depth == 0:
+                found.append(text[start:i + 1])
+    return found
+
+
+def read_verdict(raw):
+    """(verdict, findings, dropped) from cursor-agent's stdout, or a reason it cannot be read."""
+    try:
+        envelope = json.loads(raw)
+    except ValueError:
+        return None, "cursor-agent returned no JSON envelope"
+    result = envelope.get("result") if isinstance(envelope, dict) else None
+    if not isinstance(result, str) or not result.strip():
+        return None, "the envelope carried no result text"
+    if envelope.get("is_error"):
+        return None, "cursor-agent reported an error: %s" % result.strip()[:200]
+    for candidate in reversed(objects(result)):
+        try:
+            doc = json.loads(candidate)
+        except ValueError:
+            continue
+        if not isinstance(doc, dict) or doc.get("verdict") not in ("clean", "findings"):
+            continue
+        findings = []
+        for f in doc.get("findings") or []:
+            if isinstance(f, dict) and f.get("severity") in SEVERITIES and f.get("claim"):
+                findings.append({k: str(f.get(k) or "").strip()
+                                 for k in ("id", "severity", "target", "claim", "evidence", "settles")})
+        # A verdict and a list that disagree are not an answer: "clean" with a
+        # finding attached, or "findings" with none this script can use.
+        if (doc["verdict"] == "clean") != (not findings):
+            return None, "the verdict and the findings list disagree"
+        return (doc["verdict"], findings[:MAX_FINDINGS], max(len(findings) - MAX_FINDINGS, 0)), None
+    return None, "the answer carried no verdict object"
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("repo")
+    ap.add_argument("issue", type=int)
+    ap.add_argument("--model")
+    ap.add_argument("--ref")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--keep", action="store_true")
+    try:
+        args = ap.parse_args()
+    except SystemExit:
+        sys.stderr.write(__doc__.split("\n\n")[1] + "\n")
+        return 2
+    if not REPO_RE.match(args.repo):
+        die(2, "<owner/repo> expected, got %r" % args.repo)
+
+    model = args.model or os.environ.get("CURSOR_REVIEW_MODEL") or DEFAULT_MODEL
+    if CLAUDE_MODEL_RE.search(model):
+        die(6, "%s is an Anthropic model; the plan's author cannot be its attacker" % model)
+
+    agent = os.environ.get("CURSOR_AGENT") or shutil.which("cursor-agent") \
+        or os.path.expanduser("~/.local/bin/cursor-agent")
+    if not os.access(agent, os.X_OK):
+        die(2, "cursor-agent not found at %s" % agent)
+    gh = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+    if not os.access(gh, os.X_OK):
+        die(2, "gh not found on PATH or at ~/.local/bin/gh")
+    path = conf("get_repo_path", args.repo)
+    if not path:
+        die(2, "%s is not in repos.conf's get_repo_path map" % args.repo)
+    base = conf("get_repo_base", args.repo)
+    if not base:
+        die(1, "no base branch for %s" % args.repo)
+
+    view = subprocess.run([gh, "issue", "view", str(args.issue), "--repo", args.repo,
+                           "--json", "number,title,body,state"],
+                          capture_output=True, text=True, timeout=120)
+    if view.returncode != 0:
+        die(1, "gh issue view %d failed: %s" % (args.issue, view.stderr.strip()[:200]))
+    try:
+        issue = json.loads(view.stdout)
+    except ValueError:
+        die(1, "gh issue view %d returned no JSON" % args.issue)
+    body = issue.get("body") or ""
+    for heading in ("Implementation plan", "Acceptance criteria"):
+        section = re.search(SECTION_RE % heading, body, re.M | re.S)
+        if not section or not section.group(1).strip():
+            die(4, "%s#%d has no `## %s` section: nothing to attack"
+                % (args.repo, args.issue, heading))
+
+    key = None if args.dry_run else api_key()
+
+    # The base as the remote has it when it can be fetched; the local branch
+    # otherwise, which is what a checkout with no remote has.
+    subprocess.run(["/usr/bin/git", "-C", path, "fetch", "--quiet", "origin", base],
+                   capture_output=True, timeout=300)
+    ref = None
+    for candidate in ((args.ref,) if args.ref else ("origin/%s" % base, base)):
+        probe = subprocess.run(["/usr/bin/git", "-C", path, "rev-parse", "--verify", "--quiet",
+                                "%s^{commit}" % candidate], capture_output=True, text=True)
+        if probe.returncode == 0:
+            ref, sha = candidate, probe.stdout.strip()
+            break
+    if ref is None:
+        die(1, "%s has no commit %s" % (path, args.ref or base))
+
+    work = tempfile.mkdtemp(prefix="plan-attack-%s-%d-" % (args.repo.replace("/", "-"), args.issue),
+                            dir=os.environ.get("PLAN_ATTACK_TMPDIR") or "/tmp")
+    try:
+        os.mkdir(os.path.join(work, "src"))
+        with open(os.path.join(work, "issue.md"), "w") as f:
+            f.write("# %s#%d: %s\n\n%s\n" % (args.repo, args.issue, issue.get("title") or "", body))
+        archive = subprocess.Popen(["/usr/bin/git", "-C", path, "archive", "--format=tar", sha],
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        untar = subprocess.run(["/usr/bin/tar", "-x", "-C", os.path.join(work, "src")],
+                               stdin=archive.stdout, capture_output=True, timeout=600)
+        archive.stdout.close()
+        if archive.wait() != 0 or untar.returncode != 0:
+            die(1, "could not export %s at %s" % (path, ref))
+
+        if args.dry_run:
+            print("plan-attack: dry run: cursor-agent is not invoked "
+                  "(model=%s base=%s prompt=%d bytes)" % (model, sha[:7], len(PROMPT)))
+            return 0
+
+        env = dict(os.environ)
+        env["CURSOR_API_KEY"] = key
+        try:
+            run = subprocess.run(
+                [agent, "-p", PROMPT, "--model", model, "--mode", "ask", "--trust",
+                 "--output-format", "json", "--workspace", work],
+                stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env,
+                timeout=AGENT_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            die(8, "cursor-agent did not answer within %d s" % AGENT_TIMEOUT)
+        if run.returncode != 0:
+            die(8, "cursor-agent exited %d: %s" % (run.returncode, run.stderr.strip()[:300]))
+        answer, reason = read_verdict(run.stdout)
+        if answer is None:
+            die(8, reason)
+    finally:
+        if args.keep:
+            sys.stderr.write("plan-attack: workspace kept at %s\n" % work)
+        else:
+            shutil.rmtree(work, ignore_errors=True)
+
+    verdict, findings, dropped = answer
+    counts = {s: sum(1 for f in findings if f["severity"] == s) for s in SEVERITIES}
+    line = "PLAN ATTACK: repo=%s issue=%d model=%s verdict=%s findings=%d/%d base=%s" % (
+        args.repo, args.issue, model, verdict, counts["must"], counts["should"], sha[:7])
+    if args.json:
+        print(json.dumps({"repo": args.repo, "issue": args.issue, "model": model,
+                          "verdict": verdict, "base": sha, "findings": findings,
+                          "dropped": dropped}, indent=2))
+    else:
+        for f in findings:
+            print("%s  %-6s %s" % (f["id"] or "-", f["severity"].upper(), f["target"]))
+            print("    %s" % f["claim"])
+            if f["evidence"]:
+                print("    evidence: %s" % f["evidence"])
+            if f["settles"]:
+                print("    settles:  %s" % f["settles"])
+            print()
+        if dropped:
+            print("(%d more finding(s) past the cap of %d were dropped)\n" % (dropped, MAX_FINDINGS))
+    print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

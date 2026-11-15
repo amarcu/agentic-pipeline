@@ -93,7 +93,7 @@ Then **WAIT** — the human decides; silence or "whatever you think" decides not
 - **`agent/PROJECT.md`** — only the sections the conversation changed: Current State, Known Decisions, Next Steps.
 - **`CLAUDE.md`** — only if the conversation moved a boundary (MUST-ask / NEVER paths, verify gate, base branch).
 
-Every *Not now* line already there is kept — the only record that work was retired, and Step 5 and `propose-tasks` both read it.
+Every *Not now* line already there is kept — the only record that work was retired, and Step 5 and `propose-tasks` both read it. So is a line reading `refill-queue: approve`, `refill-queue: propose` or `propose-tasks: allowed`, exactly as written and on a line of its own: it is the owner's opt-in for a scheduled skill, and a rewrite that drops it turns that skill off with no one having decided to.
 
 Then reconcile the backlog against that focus — `${CLAUDE_SKILL_DIR}/references/retiring.md`: `launchd-runtime/bin/focus-orphans <repo> --json` sorts the open issues; offer each orphan, at most `MAX_RETIRE`, as keep or retire; write each retirement to *Not now*, the Decisions log and the issue (closed, labelled `retired`). An orphan a PR claims, or an untraceable issue, is listed and never offered.
 

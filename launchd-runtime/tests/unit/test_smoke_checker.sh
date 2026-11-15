@@ -75,6 +75,16 @@ test_smoke_checker_fails_an_open_gate_with_no_worker_line() {
     return $rc
 }
 
+test_smoke_checker_passes_a_morning_that_only_refilled() {
+    # On a night the one active repo is human-led, morning-proposals' final
+    # message is refill-queue's PLANNED: lines and nothing else. That is the
+    # routine having spoken, not a missing contract line (Cursor, PR #100 f2).
+    local rc=0 out
+    out=$(_smoke_verdict morning-proposals morning-proposals-refill.json)
+    assert_equal "pass" "$out" "an envelope whose only contract lines are PLANNED: passes" || rc=1
+    return $rc
+}
+
 test_smoke_checker_fails_on_a_permission_denial() {
     # Under the dry run a routine reads and decides; a denial means it reached
     # for a write. The smoke's extra deny family exists to turn that into this.
@@ -198,7 +208,7 @@ test_smoke_dry_run_contract_reaches_every_routine_skill() {
     # headless run, so the Step 0 echo is the only channel.
     local rc=0 skill
     for skill in dispatch-tasks morning-triage daily-summary propose-tasks \
-                 skill-assess work-on-task review-pr iterate-on-pr; do
+                 refill-queue skill-assess work-on-task review-pr iterate-on-pr; do
         if ! /usr/bin/grep -qF 'ROUTINE_DRY_RUN' "$REPO_ROOT/skills/$skill/SKILL.md"; then
             echo "  ASSERT FAIL: $skill/SKILL.md never echoes ROUTINE_DRY_RUN"
             rc=1

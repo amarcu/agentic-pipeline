@@ -87,8 +87,23 @@ test_record_tool_call_falls_back_to_the_session_outside_a_routine() {
     local rc=0
     _rtc_event Skill '{"skill":"work-on-task","args":"42"}' \
         | env -u ROUTINE -u ROUTINE_RUN_ID "$RTC_BIN" "$RTC_METRICS"
-    assert_equal "null sess-1 work-on-task" "$("$JQ_BIN" -r '"\(.routine) \(.run_id) \(.what)"' "$RTC_LEDGER")" \
-        "with no routine the row joins on the session id, and a skill is labelled by name" || rc=1
+    assert_equal "null sess-1 work-on-task 42" "$("$JQ_BIN" -r '"\(.routine) \(.run_id) \(.what)"' "$RTC_LEDGER")" \
+        "with no routine the row joins on the session id, and a skill is labelled by name and arguments" || rc=1
+    _rtc_teardown
+    return $rc
+}
+
+test_record_tool_call_keeps_a_skills_arguments_so_a_run_names_its_issue() {
+    # bin/item-trace reads the issue and the repo back out of this label; with
+    # the skill's name alone a dispatch run could not be tied to what it built.
+    _rtc_setup
+    local rc=0
+    _rtc_event Skill '{"skill":"work-on-task","args":"97 --repo acme/game\nPRIVATE-SECOND-LINE"}' | "$RTC_BIN" "$RTC_METRICS"
+    _rtc_event Skill '{"skill":"daily-summary"}' | "$RTC_BIN" "$RTC_METRICS"
+    assert_equal "work-on-task 97 --repo acme/game" "$(/usr/bin/head -1 "$RTC_LEDGER" | "$JQ_BIN" -r .what)" \
+        "the label is the skill and the first line of its arguments" || rc=1
+    assert_equal "daily-summary" "$(/usr/bin/tail -1 "$RTC_LEDGER" | "$JQ_BIN" -r .what)" \
+        "a skill called with no arguments is labelled by name alone" || rc=1
     _rtc_teardown
     return $rc
 }

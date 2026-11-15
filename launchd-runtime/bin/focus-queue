@@ -1,0 +1,176 @@
+#!/usr/bin/python3
+"""focus-queue - what a repo's focus still asks for and nobody has cut an issue for.
+
+Usage: focus-queue <owner/repo> [--focus <path>] [--json]
+
+The read-only half of `refill-queue`. A repo whose direction is human-led gets
+its issues from a design session, so when that session is missed the nightly
+loop has nothing to dispatch: StarBonk sat idle from 20 October to 4 November
+2026 and again from 11 November, each time with In-play lines nobody had cut.
+This says three things a refill needs before it writes anything:
+
+  MODE    whether the repo's own FOCUS.md lets a headless run cut issues, and
+          whether it may approve them. A line reading exactly
+          `refill-queue: approve` or `refill-queue: propose`; without one the
+          mode is `off` and nothing is cut: the UNCUT lines are counted but
+          not printed, so there is no line to cut from. The repo decides, not
+          this repo.
+  QUEUE   how much work is already waiting: open `approved` issues that no
+          open pull request claims and no `blocked:` label holds, the issues
+          in review, and the proposals nobody has approved.
+  UNCUT   the In-play lines, in the document's order, that no issue was cut
+          from. A line is CUT when it names an issue itself (`#82`), or when
+          an issue in any state quotes the whole line under `## Why now`. A
+          closed issue counts: finished work and retired work are both
+          answers, and cutting the line again would ask for either twice.
+
+It is a script and not prose for the reason `focus-orphans` is one: a model
+deciding which lines are already covered files the same line differently on
+two runs, and the second run cuts a duplicate. The matching is that script's,
+imported, so the two can never disagree about what quotes what.
+
+Exit codes:
+  0  printed
+  1  a query failed - an ERROR line says which, and no UNCUT line is printed,
+     because without the issue list every line looks uncut
+  2  usage, the repo is not in repos.conf's map, or it has no agent/FOCUS.md
+
+Read-only: one `gh issue list`, one `gh pr list`, one read of FOCUS.md. No
+third-party modules and nothing past 3.9: /usr/bin/python3 is 3.9.6.
+"""
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import re
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+ISSUE_LIMIT = 500
+MODE_RE = re.compile(r"^refill-queue:\s*(approve|propose)\s*$", re.M)
+# `#82` names an issue; the `#12` in `C#12` does not.
+NAMED_ISSUE_RE = re.compile(r"(?<![\w#])#\d+")
+QUOTE_MARK_RE = re.compile(r"^[ \t]*>[ \t]?", re.M)
+IN_PLAY_KIND_RE = re.compile(r"^##\s+In play\b\W*(\w+)?", re.I)
+
+
+def load_orphans():
+    """focus-orphans as a module: its normalising and its claim rule, not a copy."""
+    path = os.path.join(HERE, "focus-orphans")
+    sys.dont_write_bytecode = True   # no __pycache__ beside the scripts
+    loader = importlib.machinery.SourceFileLoader("focus_orphans", path)
+    spec = importlib.util.spec_from_loader("focus_orphans", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def in_play_lines(text):
+    """[(kind, raw line)] for every top-level bullet under an In-play heading."""
+    out, kind = [], None
+    for line in text.split("\n"):
+        if line.startswith("## "):
+            m = IN_PLAY_KIND_RE.match(line)
+            kind = (m.group(1) or "features").lower() if m else None
+            continue
+        if kind and line.startswith("- "):
+            raw = line[2:].strip()
+            if raw:
+                out.append((kind, raw))
+    return out
+
+
+def main():
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("repo")
+    parser.add_argument("--focus")
+    parser.add_argument("--json", action="store_true")
+    try:
+        args = parser.parse_args()
+    except SystemExit:
+        return 2
+    orphans = load_orphans()
+    if not orphans.REPO_RE.match(args.repo):
+        print("focus-queue: <owner/repo> expected, got %r" % args.repo, file=sys.stderr)
+        return 2
+
+    focus_path = args.focus
+    if not focus_path:
+        path = orphans.repo_path(args.repo)
+        if not path:
+            print("focus-queue: %s is not in repos.conf's get_repo_path map" % args.repo,
+                  file=sys.stderr)
+            return 2
+        focus_path = os.path.join(path, "agent", "FOCUS.md")
+    if not os.path.isfile(focus_path):
+        print("focus-queue: %s has no %s - there is no focus to cut issues from"
+              % (args.repo, focus_path), file=sys.stderr)
+        return 2
+
+    text = open(focus_path, encoding="utf-8", errors="replace").read()
+    mode = MODE_RE.search(text)
+    mode = mode.group(1) if mode else "off"
+    lines = in_play_lines(text)
+
+    try:
+        issues = orphans.gh_json(["issue", "list", "--repo", args.repo, "--state", "all",
+                                  "--limit", str(ISSUE_LIMIT),
+                                  "--json", "number,title,body,labels,state"])
+        prs = orphans.gh_json(["pr", "list", "--repo", args.repo, "--state", "open",
+                               "--json", "number,headRefName,body"])
+    except (orphans.QueryError, subprocess.SubprocessError) as exc:
+        print("MODE: %s | %s" % (args.repo, mode))
+        print("ERROR: %s - %s - no line is offered this run" % (args.repo, exc))
+        return 1
+
+    claimed = orphans.claims(prs)
+    queue = {"approved_waiting": 0, "in_review": 0, "blocked": 0, "proposed_unapproved": 0}
+    whys = []
+    for issue in issues:
+        why = orphans.WHY_NOW_RE.search(issue.get("body") or "")
+        if why:
+            # A quote reflowed over two `> ` lines is still one quote.
+            quoted = QUOTE_MARK_RE.sub("", why.group(1))
+            whys.append((issue.get("number"), orphans.normalise(quoted)))
+        if (issue.get("state") or "").upper() != "OPEN":
+            continue
+        labels = [label.get("name") or "" for label in issue.get("labels") or []]
+        if issue.get("number") in claimed:
+            queue["in_review"] += 1
+        elif "approved" in labels and any(l.startswith("blocked:") for l in labels):
+            queue["blocked"] += 1
+        elif "approved" in labels:
+            queue["approved_waiting"] += 1
+        elif "proposed" in labels:
+            queue["proposed_unapproved"] += 1
+
+    uncut, cut = [], 0
+    for kind, raw in lines:
+        wanted = orphans.normalise(raw)
+        by = [n for n, quoted in whys if wanted and wanted in quoted]
+        if NAMED_ISSUE_RE.search(raw) or by:
+            cut += 1
+        else:
+            uncut.append({"index": len(uncut) + 1, "kind": kind, "line": raw})
+
+    # Without the repo's opt-in no line is offered, the same as a failed
+    # query: a caller that ignored MODE would otherwise still have lines to cut.
+    offered = uncut if mode != "off" else []
+    if args.json:
+        print(json.dumps({"repo": args.repo, "mode": mode, "queue": queue,
+                          "in_play": len(lines), "cut": cut, "uncut": offered}, indent=1))
+    else:
+        print("MODE: %s | %s" % (args.repo, mode))
+        print("QUEUE: %s approved_waiting=%d in_review=%d blocked=%d proposed_unapproved=%d" % (
+            args.repo, queue["approved_waiting"], queue["in_review"], queue["blocked"],
+            queue["proposed_unapproved"]))
+        for entry in offered:
+            print("UNCUT: %d | %s | %s" % (entry["index"], entry["kind"], entry["line"]))
+        print("FOCUSQUEUE: %s in_play=%d cut=%d uncut=%d" % (args.repo, len(lines), cut, len(uncut)))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,389 @@
+#!/usr/bin/python3
+"""item-trace - one issue's path through the pipeline, stage by stage.
+
+Usage: item-trace <owner/repo> [<issue>] [--since YYYY-MM-DD] [--json]
+                  [--metrics-dir DIR]
+
+Every other reader here is keyed on something else. pipeline-metrics counts
+issues, review-rollup counts review rounds, routine-cost adds up routines and
+run-trace opens one run. None of them answers the question a slow week asks:
+where did THIS item wait, who was holding it, and what did it cost.
+
+With an issue number it prints that item's timeline. Without one it prints a
+row per item (every issue that carries `proposed` or `approved`, or that an
+agent pull request names) and the median of each column.
+
+The stages and where each time comes from:
+
+  approval   issue opened -> `approved` label        GitHub, the label event
+  queue      `approved`   -> pull request opened     GitHub
+  review     PR opened    -> merged or closed        GitHub
+  rounds     the marked reviews both lanes post      GitHub, as review-rollup
+  work       the worker's own time on the item       tool-calls.jsonl
+  est. cost  the item's share of its runs' spend     runs.jsonl
+
+The first four are GitHub's own timestamps and are exact. The last two are
+read from this host's ledgers, so they cover only what ran here and only
+since bin/record-tool-call began keeping a skill's arguments.
+
+`work` is exact for a forked skill (work-on-task): its Skill row is stamped
+when the worker returns and carries how long it took. A skill that runs inline
+(iterate-on-pr) returns at once, so its time is counted from its Skill row to
+the next item's row, or to the run's last tool call.
+
+`est. cost` is an ESTIMATE and is always printed as one. A dispatch run works
+several issues in one model session and the CLI reports one cost for all of
+it, so the run's spend is divided between its items in proportion to `work`.
+The run's own overhead is inside that figure, and a Cursor review is not: the
+Cursor CLI reports tokens and no price.
+
+Requires: gh (authenticated). Read-only; makes no writes to GitHub.
+Exit codes: 0 printed, 1 a query failed or the issue is not in the repo,
+2 usage.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+from datetime import datetime
+
+DEFAULT_DIR = os.path.join(
+    os.environ.get("AGENTIC_SKILLS_HOME") or os.path.expanduser("~/.agentic-skills"), "routines", "metrics")
+AGENT_BRANCH_RE = re.compile(r"^(?:task/issue-|worktree-issue-)(\d+)")
+MARKER_RE = re.compile(
+    r"^<!-- (review-pr|cursor-review) repo=\S+ pr=\d+ round=(\d+) head=[0-9a-f]{7,40}"
+    r"(?: model=\S+)? verdict=([a-z-]+)")
+# The label record-tool-call writes for a Skill call: the skill, then its
+# arguments. The number is an issue for the worker and a pull request for the
+# iterator.
+WORK_RE = re.compile(r"^(work-on-task|iterate-on-pr)\s+#?(\d+)\b(.*)$")
+REPO_ARG_RE = re.compile(r"--repo[ =](\S+)")
+# Under this a Skill row is a skill that loaded inline, not a worker that ran.
+FORK_MIN_MS = 1000
+ITEM_LABELS = ("proposed", "approved")
+
+
+def gh_bin():
+    found = shutil.which("gh") or os.path.expanduser("~/.local/bin/gh")
+    if not os.access(found, os.X_OK):
+        sys.stderr.write("item-trace: gh not found on PATH or at ~/.local/bin/gh\n")
+        sys.exit(1)
+    return found
+
+
+def gh_api(gh, path):
+    """One paginated read; --slurp separates the pages structurally."""
+    out = subprocess.run([gh, "api", path, "--paginate", "--slurp"],
+                         capture_output=True, text=True, timeout=300)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr.strip()[:200] or "gh api %s failed" % path)
+    pages = json.loads(out.stdout or "[]")
+    return [item for page in pages for item in page]
+
+
+def gh_time(ts):
+    # fromisoformat rejects GitHub's trailing Z before Python 3.11.
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")) if ts else None
+    except ValueError:
+        return None
+
+
+def ledger_time(ts):
+    try:
+        return datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except (TypeError, ValueError):
+        return None
+
+
+def ledger_rows(path):
+    """A ledger's rows, in file order. A half-written line is left out."""
+    out = []
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and row.get("run_id"):
+                    out.append(row)
+    except OSError:
+        pass
+    return out
+
+
+def work_spans(metrics, repo):
+    """This repo's worker spans: [{kind, number, run_id, routine, end, seconds, est_cost}].
+
+    A run's spend is shared between ALL of its items, whatever repo they are
+    in, so every run is measured whole before this repo's rows are kept.
+    """
+    cost = {}
+    for row in ledger_rows(os.path.join(metrics, "runs.jsonl")):
+        if isinstance(row.get("cost_usd"), (int, float)):
+            cost[row["run_id"]] = row["cost_usd"]
+
+    by_run = {}
+    for row in ledger_rows(os.path.join(metrics, "tool-calls.jsonl")):
+        at = ledger_time(row.get("ts"))
+        if at is not None:
+            by_run.setdefault(row["run_id"], []).append((at, row))
+
+    spans = []
+    for run_id, calls in by_run.items():
+        calls.sort(key=lambda c: c[0])
+        marks = []
+        for at, row in calls:
+            m = WORK_RE.match(str(row.get("what") or "")) if row.get("tool") == "Skill" else None
+            if not m or "--dry-run" in m.group(3):
+                continue
+            named = REPO_ARG_RE.search(m.group(3))
+            ms = row.get("duration_ms")
+            forked = isinstance(ms, (int, float)) and ms >= FORK_MIN_MS
+            marks.append({
+                "kind": m.group(1), "number": int(m.group(2)),
+                "repo": named.group(1) if named else None,
+                "run_id": run_id, "routine": row.get("routine"),
+                "end": at, "forked": forked,
+                "start_ts": at.timestamp() - (ms / 1000.0 if forked else 0.0),
+                "seconds": ms / 1000.0 if forked else None,
+            })
+        last = calls[-1][0].timestamp()
+        for i, mark in enumerate(marks):
+            if mark["seconds"] is None:
+                until = marks[i + 1]["start_ts"] if i + 1 < len(marks) else last
+                mark["seconds"] = max(until - mark["start_ts"], 0.0)
+        total = sum(mark["seconds"] for mark in marks)
+        for mark in marks:
+            share = mark["seconds"] / total if total > 0 else 1.0 / len(marks)
+            mark["est_cost"] = round(cost[run_id] * share, 2) if run_id in cost else None
+            if mark["repo"] == repo:
+                spans.append(mark)
+    return spans
+
+
+def issue_of(pr):
+    m = AGENT_BRANCH_RE.match(pr.get("head", {}).get("ref", ""))
+    return int(m.group(1)) if m else None
+
+
+def seconds_between(start, end):
+    if start is None or end is None:
+        return None
+    gap = (end - start).total_seconds()
+    return gap if gap >= 0 else None
+
+
+def trace_item(gh, repo, issue, pulls, spans):
+    n = issue["number"]
+    mine = [p for p in pulls if issue_of(p) == n]
+    mine.sort(key=lambda p: p["number"])
+    merged = [p for p in mine if p.get("merged_at")]
+    pr = merged[-1] if merged else (mine[-1] if mine else None)
+
+    approved = None
+    for ev in gh_api(gh, "repos/%s/issues/%d/events?per_page=100" % (repo, n)):
+        if ev.get("event") == "labeled" and (ev.get("label") or {}).get("name") == "approved":
+            approved = gh_time(ev.get("created_at"))
+            break
+
+    reviews = []
+    if pr:
+        for rv in gh_api(gh, "repos/%s/pulls/%d/reviews?per_page=100" % (repo, pr["number"])):
+            m = MARKER_RE.match(rv.get("body") or "")
+            if m:
+                reviews.append({"at": rv.get("submitted_at"), "lane": m.group(1),
+                                "round": int(m.group(2)), "verdict": m.group(3)})
+        reviews.sort(key=lambda r: r["at"] or "")
+    rounds = {}
+    for r in reviews:
+        rounds.setdefault(r["lane"], set()).add(r["round"])
+
+    opened = gh_time(issue.get("created_at"))
+    pr_opened = gh_time(pr.get("created_at")) if pr else None
+    pr_merged = gh_time(pr.get("merged_at")) if pr else None
+    pr_closed = gh_time(pr.get("closed_at")) if pr else None
+    issue_closed = gh_time(issue.get("closed_at"))
+    if pr_merged:
+        state, end = "merged", pr_merged
+    elif pr and pr.get("state") == "open":
+        state, end = "in review", None
+    elif issue.get("state") == "closed":
+        state, end = "closed", issue_closed
+    elif pr:
+        state, end = "pr closed", pr_closed
+    elif approved:
+        state, end = "queued", None
+    else:
+        state, end = "awaiting approval", None
+
+    pr_numbers = set(p["number"] for p in mine)
+    work = [s for s in spans
+            if (s["kind"] == "work-on-task" and s["number"] == n)
+            or (s["kind"] == "iterate-on-pr" and s["number"] in pr_numbers)]
+    work.sort(key=lambda s: s["end"])
+    costs = [s["est_cost"] for s in work if s["est_cost"] is not None]
+    return {
+        "issue": n,
+        "title": issue.get("title") or "",
+        "state": state,
+        "pr": pr["number"] if pr else None,
+        "opened_at": issue.get("created_at"),
+        "approved_at": approved.isoformat() if approved else None,
+        "pr_opened_at": pr.get("created_at") if pr else None,
+        "ended_at": end.isoformat() if end else None,
+        "approval_s": seconds_between(opened, approved),
+        "queue_s": seconds_between(approved, pr_opened),
+        "review_s": seconds_between(pr_opened, pr_merged or (pr_closed if state != "in review" else None)),
+        "total_s": seconds_between(opened, end),
+        "rounds": max(len(r) for r in rounds.values()) if rounds else 0,
+        "reviews": reviews,
+        "work_s": round(sum(s["seconds"] for s in work), 1) if work else None,
+        "est_cost_usd": round(sum(costs), 2) if costs else None,
+        "work": [{"skill": s["kind"], "number": s["number"], "run_id": s["run_id"],
+                  "routine": s["routine"], "finished_at": s["end"].isoformat(),
+                  "seconds": round(s["seconds"], 1), "measured": "fork" if s["forked"] else "to-next",
+                  "est_cost_usd": s["est_cost"]} for s in work],
+    }
+
+
+def span(seconds):
+    if seconds is None:
+        return "-"
+    s = int(round(seconds))
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    if s < 172800:
+        return "%dh %02dm" % (s // 3600, s % 3600 // 60)
+    return "%dd %dh" % (s // 86400, s % 86400 // 3600)
+
+
+def money(value):
+    return "-" if value is None else "~$%.2f" % value
+
+
+def clock(ts):
+    at = gh_time(ts) or ledger_time(ts)
+    return at.astimezone().strftime("%Y-%m-%d %H:%M") if at else "-"
+
+
+def print_item(repo, item):
+    print("%s#%d  %s" % (repo, item["issue"], item["title"][:70]))
+    print("state: %s%s" % (item["state"], "   PR #%d" % item["pr"] if item["pr"] else ""))
+    print()
+    steps = [(item["opened_at"], "issue opened", "")]
+    if item["approved_at"]:
+        steps.append((item["approved_at"], "approved", "waited %s for approval" % span(item["approval_s"])))
+    if item["pr_opened_at"]:
+        steps.append((item["pr_opened_at"], "PR #%d opened" % item["pr"],
+                      "queued %s" % span(item["queue_s"]) if item["approved_at"] else ""))
+    for r in item["reviews"]:
+        steps.append((r["at"], "review round %d: %s" % (r["round"], r["verdict"]), r["lane"]))
+    if item["ended_at"]:
+        note = "in review %s" % span(item["review_s"]) if item["review_s"] is not None else ""
+        steps.append((item["ended_at"], item["state"], note))
+    for at, what, note in steps:
+        print(("  %-16s  %-34s %s" % (clock(at), what, note)).rstrip())
+    if item["total_s"] is not None:
+        print("  %-16s  %-34s %s" % ("", "opened to %s" % item["state"], span(item["total_s"])))
+    print()
+    if not item["work"]:
+        print("worker runs: none in this host's ledger")
+        return
+    print("worker runs on this host (est. cost is the item's share of the run, not a measurement)")
+    for w in item["work"]:
+        print("  %-16s  %-14s %-5s %8s  %9s  %s" % (
+            clock(w["finished_at"]), w["skill"], "#%d" % w["number"], span(w["seconds"]),
+            money(w["est_cost_usd"]), w["run_id"]))
+    print("  %-16s  %-14s %-5s %8s  %9s" % ("", "total", "", span(item["work_s"]), money(item["est_cost_usd"])))
+
+
+def print_table(repo, items):
+    print("%s: %d item(s)" % (repo, len(items)))
+    head = "%-6s %-18s %-5s %9s %9s %9s %6s %8s %9s" % (
+        "issue", "state", "PR", "approval", "queue", "review", "rounds", "work", "est.cost")
+    print(head)
+    for it in items:
+        print("%-6s %-18s %-5s %9s %9s %9s %6d %8s %9s" % (
+            "#%d" % it["issue"], it["state"], "#%d" % it["pr"] if it["pr"] else "-",
+            span(it["approval_s"]), span(it["queue_s"]), span(it["review_s"]),
+            it["rounds"], span(it["work_s"]), money(it["est_cost_usd"])))
+
+    def median(key):
+        values = [it[key] for it in items if it[key] is not None]
+        return statistics.median(values) if values else None
+
+    print("%-6s %-18s %-5s %9s %9s %9s %6s %8s %9s" % (
+        "median", "", "", span(median("approval_s")), span(median("queue_s")),
+        span(median("review_s")), "%g" % statistics.median([it["rounds"] for it in items]),
+        span(median("work_s")), money(median("est_cost_usd"))))
+    print()
+    print("approval = opened to `approved`; queue = `approved` to PR opened; review = PR opened")
+    print("to merged or closed; rounds = the most review rounds one lane took. Those are GitHub's")
+    print("times. work and est.cost come from this host's ledgers: work is the worker's own time,")
+    print("est.cost is the item's share of its runs' spend and is an estimate. A Cursor review")
+    print("is not in it.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("repo")
+    ap.add_argument("issue", nargs="?", type=int)
+    ap.add_argument("--since")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--metrics-dir")
+    args = ap.parse_args()
+    if not re.match(r"^[\w.-]+/[\w.-]+$", args.repo):
+        sys.stderr.write("item-trace: the repo is owner/name, got: %s\n" % args.repo)
+        return 2
+    if args.since and not re.match(r"^\d{4}-\d{2}-\d{2}$", args.since):
+        sys.stderr.write("item-trace: --since takes YYYY-MM-DD, got: %s\n" % args.since)
+        return 2
+    metrics = args.metrics_dir or os.environ.get("METRICS_DIR") or DEFAULT_DIR
+
+    gh = gh_bin()
+    try:
+        pulls = gh_api(gh, "repos/%s/pulls?state=all&per_page=100" % args.repo)
+        # The issues listing returns pull requests too; they carry this key.
+        issues = [i for i in gh_api(gh, "repos/%s/issues?state=all&per_page=100" % args.repo)
+                  if "pull_request" not in i]
+        named = set(issue_of(p) for p in pulls)
+        if args.issue is not None:
+            chosen = [i for i in issues if i["number"] == args.issue]
+            if not chosen:
+                sys.stderr.write("item-trace: no issue #%d in %s\n" % (args.issue, args.repo))
+                return 1
+        else:
+            chosen = [i for i in issues
+                      if i["number"] in named
+                      or any(l.get("name") in ITEM_LABELS for l in i.get("labels") or [])]
+            if args.since:
+                chosen = [i for i in chosen if (i.get("created_at") or "")[:10] >= args.since]
+        chosen.sort(key=lambda i: i["number"])
+        spans = work_spans(metrics, args.repo)
+        items = [trace_item(gh, args.repo, i, pulls, spans) for i in chosen]
+    except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+        sys.stderr.write("item-trace: %s: %s\n" % (args.repo, e))
+        return 1
+
+    if args.json:
+        json.dump({"repo": args.repo, "since": args.since, "items": items}, sys.stdout, indent=2)
+        print()
+    elif args.issue is not None:
+        print_item(args.repo, items[0])
+    elif not items:
+        print("%s: no items%s" % (args.repo, " opened since %s" % args.since if args.since else ""))
+    else:
+        print_table(args.repo, items)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -98,6 +98,17 @@ funnel:  ## Pipeline funnel metrics: proposal->approval->PR->merge rates per rep
 .PHONY: review-rollup
 review-rollup:  ## Review rounds per agent PR: clean passes, rounds, findings, merges on an unpassed commit.
 	@$(REPO_ROOT)/launchd-runtime/bin/review-rollup
+
+.PHONY: item
+item:  ## One issue's path through the pipeline (make item REPO=owner/name ISSUE=97), or every item's stage times (no ISSUE).
+	@if [ -z "$(REPO)" ]; then echo "usage: make item REPO=owner/name [ISSUE=<n>] [SINCE=YYYY-MM-DD]" >&2; exit 2; fi; \
+	$(REPO_ROOT)/launchd-runtime/bin/item-trace "$(REPO)" $(ISSUE) $(if $(SINCE),--since "$(SINCE)")
+
+.PHONY: attack
+attack:  ## A non-Claude model attacks one issue's plan before it is built (make attack REPO=owner/name ISSUE=97). Spends Cursor usage.
+	@if [ -z "$(REPO)" ] || [ -z "$(ISSUE)" ]; then echo "usage: make attack REPO=owner/name ISSUE=<n>" >&2; exit 2; fi; \
+	$(REPO_ROOT)/launchd-runtime/bin/plan-attack "$(REPO)" "$(ISSUE)"
+
 .PHONY: trace
 trace:  ## One run's tool calls as a timeline (make trace ROUTINE=dispatch-tasks-night, or RUN=<run id>; neither lists runs).
 	@if [ -n "$(RUN)" ]; then \
